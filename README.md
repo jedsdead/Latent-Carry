@@ -1,0 +1,130 @@
+# H3 Latent Carry
+
+A Wan2GP plugin for MiniMax H3 that hands each sliding window the previous
+window's latents instead of decoding them to frames and re-encoding them. Each
+window is a copy of a copy; skipping that round trip slows the loss, so long
+continuous shots stay clean for longer. Expect it to help most over 4-5 windows.
+After that, H3's own drift still builds up.
+
+It also saves each video's last latents, so **Continue Video** on that file picks
+up from the latents too, not from the compressed MP4.
+
+Version 2.0.0 · MIT
+
+## Install
+
+Copy the folder into `Wan2GP/plugins/`, enable **H3 Latent Carry** in the
+**Plugins** tab, save and restart.
+
+Don't enable it together with **Sliding Window Latents** (it replaces that
+plugin) or **Sliding Window Anchor**.
+
+## Settings
+
+The **H3 Latent Carry** panel sits just above the Generate button.
+
+| Setting | What it does |
+|---|---|
+| Enable latent carry | Turns the plugin on or off. |
+| Carry video latents | Hands the video latents to the next window. Off re-encodes frames as normal. |
+| Carry audio latents | Hands the soundtrack latents on too. |
+| Audio context (seconds) | How much audio the next window hears. 0 uses Wan2GP's own 0.75 s. |
+| Carried latents | How much of the previous window is handed on: 7 = 22 frames, 12 = 39, 17 = 56. |
+
+**Colour hold**
+
+| Setting | What it does |
+|---|---|
+| Hold each shot's colour | Keeps brightness, contrast and colour steady while a shot continues across windows. A cut starts a new reference. |
+| Hold | Which of brightness, contrast, saturation and colour cast to keep steady. |
+| Strength | 1 removes all of the drift; lower values remove part of it. |
+
+The hold measures each continuous shot's opening and pulls the rest of that shot
+back to it, frame by frame and in the carried latents. Cuts are detected, both
+at a join and inside a window, so a new shot gets its own reference and is never
+dragged toward the last one. It holds the grade; it does not stop texture and
+detail from building up.
+
+**Continue Video**
+
+| Setting | What it does |
+|---|---|
+| Save latents with each video | Stores the last window's latents (about 2-20 MB per video). |
+| Save latents for | *Final video of each job*, or *Every sliding window* so you can continue a job that stopped early. |
+| Use saved latents when continuing a video | Continue Video on a saved file uses its latents. |
+| Storage limit (GB) | The oldest entries are removed first. |
+| Saved latents / Use for next continuation | Forces one entry for the next Continue Video, for example after trimming a video. It is used once. |
+| Diagnostics | Shows whether everything is installed and working. |
+| Remove entries for deleted videos / Delete all saved latents | Housekeeping. Your videos are never touched. |
+
+**Advanced**
+
+| Setting | What it does |
+|---|---|
+| Coordinate correction | Keep it on. Off is only for comparison. |
+
+### Recommended
+
+- Latent carry on: video and audio, **7** carried latents.
+- Colour hold on: all four aspects, strength **1**.
+- Continue Video saving on, *Final video of each job*, and restore on.
+
+For long videos, fewer and longer windows beat many short ones.
+
+## Continue Video
+
+The saved latents are matched to the video by its content, so renaming or
+moving the file is fine. A colour-held shot keeps its reference into the
+continuation. If the file was trimmed, re-encoded or edited, it no longer
+matches; pin its entry in the panel or let the first window re-encode as normal.
+The console says when, and why, saved latents are not used.
+
+Files live in the plugin's `latents/` folder. Set `H3LC_STORE_DIR` to put them
+elsewhere.
+
+## When it stands aside
+
+If Wan2GP's H3 code isn't what the plugin expects, it doesn't patch anything and
+says so in the console, and Wan2GP runs as normal. It also hands a window back to
+the native re-encode when the carried latents don't fit (a different resolution,
+fps or model, or a join it can't line up), with a console line saying why. Other
+refiners, such as H3 Face Refiner, pass straight through.
+
+After a Wan2GP update you can check it with:
+
+```
+python tools/check_wan2gp.py /path/to/Wan2GP
+```
+
+## Environment variables
+
+Panel settings are saved to `state/settings.json`, and they override these:
+`H3LC_ENABLE`, `H3LC_VIDEO`, `H3LC_AUDIO`, `H3LC_AUDIO_CONTEXT`, `H3LC_LATENTS`,
+`H3LC_COLOUR`, `H3LC_COLOUR_AXES`, `H3LC_COLOUR_STRENGTH`, `H3LC_CUT_THRESHOLD`,
+`H3LC_SAVE`, `H3LC_SAVE_SCOPE`, `H3LC_RESTORE`, `H3LC_STORE_GB`,
+`H3LC_STORE_DIR`, `H3LC_FIX_COORDS`, `H3LC_VERBOSE`.
+
+## Tests
+
+The tests need only `numpy` (no torch, no GPU):
+
+```
+for t in tests/test_*.py; do python "$t"; done
+```
+
+## Removing
+
+Disable it in the Plugins tab and restart. Delete `latents/` to remove saved
+latents.
+
+## Credit
+
+The idea of carrying context in latents came from
+[ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
+by NikoDemon80. Saving latents with each video follows
+[H3 Latent Continue](https://github.com/g3n3rativ3/wan2gp-h3-latent-continue).
+No code is shared with either.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE). Changes are in [CHANGELOG.md](CHANGELOG.md).
