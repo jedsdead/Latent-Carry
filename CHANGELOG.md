@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1
+
+- **Fixed audio carry with Wan2GP v18.19+.** Wan2GP now generates about 125 ms
+  of audio past each window's last frame. The plugin was carrying that tail into
+  the next window as audio from before the join. It is now cut off first.
+- Saved latents from earlier versions still continue the video; their audio is
+  re-encoded as normal.
+
 ## 2.0.0
 
 Simplified to what worked on real runs: latent carry, the colour hold, and

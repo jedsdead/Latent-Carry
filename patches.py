@@ -168,6 +168,10 @@ _MAX_CACHED_AUDIO_LATENTS = 192     # 18 frames at 40 latent fps is ~30; headroo
 # latents/s (models/minimax_h3/components/audio_autoencoder.py).  Resolved from
 # the pipeline where available rather than assumed.
 _AUDIO_LATENT_FPS_FALLBACK = 40.0
+# Wan2GP v18.19+ generates H3 audio a few latents past the last video frame
+# (pipeline.H3_AUDIO_TAIL_LATENTS = 5, ~125 ms).  That tail is after the join, so
+# it is cut off before caching.  Anything larger than this is not a tail.
+_MAX_AUDIO_TAIL_LATENTS = 16
 _CLIP_LENGTH = 17                   # H3 window quantum
 _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
 _LOCK_REFERENCE_FRAMES = 17         # a shot's opening frames that define the look held
@@ -415,7 +419,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -860,15 +864,36 @@ def _patched_decode(self, latents, *args, **kwargs):
     return decoded
 
 
+def _audio_overrun(count):
+    """Audio latents decoded past the window's last video frame.
+
+    Newer Wan2GP adds a short audio tail after the last frame.  The plan knows
+    how many latents the frames themselves span; anything beyond that, up to
+    _MAX_AUDIO_TAIL_LATENTS, is the tail.  Older Wan2GP has none, so this is 0.
+    """
+    target = (STATE.plan or {}).get("audio_target_latents")
+    if not target:
+        return 0
+    extra = int(count) - int(target)
+    return extra if 0 < extra <= _MAX_AUDIO_TAIL_LATENTS else 0
+
+
 def _patched_audio_decode(self, latents, *args, **kwargs):
     waveform = _ORIGINALS["audio_decode"](self, latents, *args, **kwargs)
     if _PASSTHROUGH.get() is not None:
         return waveform
     try:
-        tail = latents[..., -_MAX_CACHED_AUDIO_LATENTS:].detach().to(torch.float32).cpu()
+        count = int(latents.shape[-1])
+        overrun = _audio_overrun(count)
+        end = count - overrun
+        tail = latents[..., :end][..., -_MAX_CACHED_AUDIO_LATENTS:].detach().to(torch.float32).cpu()
+        at_join = waveform
+        if overrun and count:
+            # Signature of the half second ending at the join, not at the tail.
+            at_join = waveform[..., :int(round(int(waveform.shape[-1]) * end / count))]
         with STATE.lock:
             STATE.audio_latents = tail
-            STATE.audio_signature = _audio_signature(waveform)
+            STATE.audio_signature = _audio_signature(at_join)
             STATE.audio_generation = STATE.generation
             STATE.audio_source_window_no = (STATE.plan or {}).get("window_no")
     except Exception as error:
@@ -1302,6 +1327,9 @@ def _plan_window(pipeline, args, kwargs):
             # for a missing input_waveform).  Without both, the first
             # _encode_audio call of this window is something else entirely.
             "continuation_audio": bool(count) and values.get("input_waveform") is not None,
+            # Audio latents the window's frames span; any more is Wan2GP's tail.
+            "audio_target_latents": (int(round(aligned / geometry["fps"] * _audio_latent_fps()))
+                                     if geometry.get("fps") else None),
             "expected_latents": video_latent_frames(aligned)}
 
 
@@ -1597,6 +1625,11 @@ def _seed_from_entry(found, sha, note=""):
         STATE.usable = True
         STATE.total_latents = int(manifest["total_latents"])
         STATE.expected_latents = _int_or_none(manifest.get("expected_latents"))
+        if audio is not None and not manifest.get("audio_ends_at_join"):
+            # Saved before 2.0.1: with Wan2GP v18.19+ its audio may run ~125 ms
+            # past the join.  The video is still used; the audio is re-encoded.
+            audio = None
+            _log("saved audio latents predate 2.0.1, re-encoding the audio")
         if audio is not None:
             STATE.audio_latents = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
             STATE.audio_signature = (
@@ -1718,6 +1751,7 @@ def snapshot_for_export(tensor, fps):
                 "expected_latents": _int_or_none(expected),
                 "window_no": plan.get("window_no"),
                 "carried_from": STATE.restored,
+                "audio_ends_at_join": True,
                 "lock_reference": STATE.lock_reference}
     return {"arrays": arrays, "manifest": manifest}, None
 

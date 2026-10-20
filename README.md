@@ -9,7 +9,7 @@ After that, H3's own drift still builds up.
 It also saves each video's last latents, so **Continue Video** on that file picks
 up from the latents too, not from the compressed MP4.
 
-Version 2.0.0 · MIT
+Version 2.0.1 · MIT
 
 ## Install
 
