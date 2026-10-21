@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.2
+
+- **Off-grid window lengths now carry.** H3 rounds each window's frame count to
+  its 5 + 17n grid before generating. The plugin now does the same before
+  planning, so a window whose length is off the grid carries instead of quietly
+  re-encoding (from Sliding Window Latents 1.2.5).
+
 ## 2.0.1
 
 - **Fixed audio carry with Wan2GP v18.19+.** Wan2GP now generates about 125 ms

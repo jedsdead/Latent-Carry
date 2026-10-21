@@ -419,7 +419,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -1301,7 +1301,12 @@ def _plan_window(pipeline, args, kwargs):
 
     geometry["continuation_frames"] = int(count)
 
-    target_frames = int(values.get("frame_num") or 0) - history_count
+    # generate() rounds frame_num onto H3's 5 + 17n grid before counting frames;
+    # without the same step an off-grid count reads as a truncated window.
+    frame_num = int(values.get("frame_num") or 0)
+    if frame_num > 0:
+        frame_num = normalize_frame_count(frame_num, 5, _CLIP_LENGTH, 5)
+    target_frames = frame_num - history_count
     if target_frames <= 0:
         return refuse("no target frames")
     aligned = normalize_frame_count(target_frames, 5, _CLIP_LENGTH, 5)
