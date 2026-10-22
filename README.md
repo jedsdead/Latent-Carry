@@ -9,7 +9,7 @@ After that, H3's own drift still builds up.
 It also saves each video's last latents, so **Continue Video** on that file picks
 up from the latents too, not from the compressed MP4.
 
-Version 2.0.2 · MIT
+Version 2.1.0 · MIT
 
 ## Install
 
@@ -30,6 +30,7 @@ The **H3 Latent Carry** panel sits just above the Generate button.
 | Carry audio latents | Hands the soundtrack latents on too. |
 | Audio context (seconds) | How much audio the next window hears. 0 uses Wan2GP's own 0.75 s. |
 | Carried latents | How much of the previous window is handed on: 7 = 22 frames, 12 = 39, 17 = 56. |
+| Join frame from latents | Experimental. Builds the frame each window, and each Continue Video, starts from out of the carried latents instead of the finished or saved video. |
 
 **Colour hold**
 
@@ -99,7 +100,7 @@ python tools/check_wan2gp.py /path/to/Wan2GP
 ## Environment variables
 
 Panel settings are saved to `state/settings.json`, and they override these:
-`H3LC_ENABLE`, `H3LC_VIDEO`, `H3LC_AUDIO`, `H3LC_AUDIO_CONTEXT`, `H3LC_LATENTS`,
+`H3LC_ENABLE`, `H3LC_VIDEO`, `H3LC_AUDIO`, `H3LC_AUDIO_CONTEXT`, `H3LC_LATENTS`, `H3LC_LATENT_ANCHOR`,
 `H3LC_COLOUR`, `H3LC_COLOUR_AXES`, `H3LC_COLOUR_STRENGTH`, `H3LC_CUT_THRESHOLD`,
 `H3LC_SAVE`, `H3LC_SAVE_SCOPE`, `H3LC_RESTORE`, `H3LC_STORE_GB`,
 `H3LC_STORE_DIR`, `H3LC_FIX_COORDS`, `H3LC_VERBOSE`.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0
+
+- **Join frame from latents** (experimental, off by default). H3 pins the
+  join frame at the start of each window. Wan2GP takes it from the finished
+  video: rounded to 8-bit between windows, and read back from the compressed
+  file for Continue Video. With this on, it is decoded from the carried
+  latents instead, in full precision, with whatever decoder is loaded. If the
+  result does not match the video's frame, the video's frame is used.
+
 ## 2.0.2
 
 - **Off-grid window lengths now carry.** H3 rounds each window's frame count to

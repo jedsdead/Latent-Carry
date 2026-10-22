@@ -173,6 +173,10 @@ check("history is still continuation[:, -count:-1]",
       "continuation[:, -continuation_count:-1]" in pipe_src)
 check("the target is still normalize_frame_count(target_frames, 5, 17, 5)",
       "normalize_frame_count(target_frames, 5, 17, 5)" in pipe_src)
+check("pipeline.MiniMaxH3Pipeline._add_image_condition (join frame from latents)",
+      find(pipeline, "MiniMaxH3Pipeline._add_image_condition") is not None)
+check("the join frame is still pinned right after the history block",
+      "add_image_condition(prepare_stage_video(continuation[:, -1:]), 0)" in pipe_src)
 check("_add_video_history is still what receives the history frames",
       "self._add_video_history(prepare_stage_video(history_frames)" in pipe_src)
 flag = [l.strip() for l in (ROOT / "models/minimax_h3/constants.py").read_text(errors="replace").splitlines()

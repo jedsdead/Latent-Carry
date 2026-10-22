@@ -174,6 +174,10 @@ _AUDIO_LATENT_FPS_FALLBACK = 40.0
 _MAX_AUDIO_TAIL_LATENTS = 16
 _CLIP_LENGTH = 17                   # H3 window quantum
 _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
+# How far the latent-built join frame may differ from Wan2GP's own (mean absolute
+# difference on the signed [-1, 1] scale) before it is distrusted.  Rounding and
+# video compression stay well under this; a different frame does not.
+_ANCHOR_TOLERANCE = 0.12
 _LOCK_REFERENCE_FRAMES = 17         # a shot's opening frames that define the look held
 _CUT_MIN = 0.08                     # frame-to-frame structural change that is always a cut
 _CUT_RATIO = 6.0                    # ... or this many times the window's typical change
@@ -248,6 +252,10 @@ class _Config:
             self.audio_tolerance = 0.15
         # Search a run of frames for the join rather than testing one offset.
         self.align_search = _flag("H3LC_ALIGN_SEARCH", "1")
+        # Build the join frame H3 pins at frame 0 from the carried latents
+        # instead of from the finished (8-bit, or for Continue Video, compressed)
+        # frame.  Off by default while it is being evaluated.
+        self.latent_anchor = _flag("H3LC_LATENT_ANCHOR", "0")
         # Hold each continuous shot to the look of its own opening.  Off by
         # default: a plugin update should not quietly start altering frames.
         self.colour = _flag("H3LC_COLOUR", "0")
@@ -390,7 +398,11 @@ class _State:
                       "colour_applied": 0, "video_off": 0,
                       "restored": 0, "saved": 0, "save_skipped": 0,
                       "hook_generate_media": 0, "hook_save_video": 0,
-                      "hook_record_file": 0, "windows": 0, "passthrough": 0}
+                      "hook_record_file": 0, "windows": 0, "passthrough": 0,
+                      "anchor_from_latents": 0, "anchor_native": 0}
+        # Carried latents waiting to become this stage's join frame; set when
+        # the history block is carried, consumed by the next frame-0 condition.
+        self.anchor_latents = None
         # Name of the source video whose saved latents seeded this job, if any.
         self.restored = None
         # Measured cost of one native history encode, for the panel's estimate.
@@ -419,7 +431,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -1349,6 +1361,9 @@ def _patched_generate(self, *args, **kwargs):
         finally:
             _PASSTHROUGH.reset(token)
     previous, previous_usable = STATE.generation, (STATE.plan or {}).get("usable")
+    # Never let a join frame pending from an earlier call reach this one's
+    # start image.
+    STATE.anchor_latents = None
     if ON_GENERATE is not None:
         try:
             ON_GENERATE()
@@ -1856,6 +1871,7 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
         return _ORIGINALS["add_video_history"](self, video, visual_latents, keyframes,
                                                *args, **kwargs)
     STATE.active_latents = None
+    STATE.anchor_latents = None
     # Cleared per window: a stale value would shift the layout for a window
     # whose audio fell back to the native encode.
     STATE.audio_extra = 0
@@ -1901,11 +1917,77 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     visual_latents.append(latents)
     keyframes.append({"anchor": "history", "latent_frame_count": latents.shape[2]})
     STATE.active_latents = int(latents.shape[2])
+    if CONFIG.latent_anchor:
+        # pipeline.generate pins the join frame right after the history block:
+        # add_image_condition(prepare_stage_video(continuation[:, -1:]), 0).
+        STATE.anchor_latents = latents
     STATE.stats["engaged"] += 1
     _log(f"carried {latents.shape[2]} latents from the previous window "
          f"(coords {'corrected' if CONFIG.fix_coords else 'UNCORRECTED'})")
 
     return None                      # matches stock; see the docstring above
+
+
+def _signed_float(video):
+    """Wan2GP hands frames over as signed floats or as uint8; return signed floats."""
+    video = video.detach()
+    if video.dtype == torch.uint8:
+        return video.to(torch.float32).div(127.5).sub(1.0)
+    return video.to(torch.float32)
+
+
+def _join_frame_from_latents(pipeline, latents, like):
+    """The last frame of the carried latents, decoded in full precision.
+
+    The carried slice starts on one of the decoder's 5-latent chunk boundaries
+    (_take_cached refuses any other), so decoding it on its own reproduces the
+    tail of the window's own decode exactly; only the 8-bit rounding of the
+    finished frame (and, for Continue Video, the file's compression) is left
+    out.  Whatever decoder is loaded is used, as for the video itself, and the
+    frame is resized exactly as prepare_stage_video resizes the native one.
+    """
+    vae = pipeline.vae
+    device = getattr(pipeline, "device", None)
+    z = latents.to(device=device) if device is not None else latents
+    token = _PASSTHROUGH.set(True)          # not a window: no capture, no colour hold
+    try:
+        decoded = _ORIGINALS["decode"](vae, z.to(vae._model_dtype))
+    finally:
+        _PASSTHROUGH.reset(token)
+    frame = decoded[0, :, -1:].to(torch.float32).cpu().clamp_(-1.0, 1.0)
+    height, width = int(like.shape[-2]), int(like.shape[-1])
+    if tuple(frame.shape[-2:]) != (height, width):
+        frame = torch.nn.functional.interpolate(
+            frame.permute(1, 0, 2, 3), size=(height, width), mode="bicubic",
+            align_corners=False, antialias=True).permute(1, 0, 2, 3).clamp_(-1.0, 1.0)
+    return frame
+
+
+def _patched_add_image_condition(self, image, frame_index, *args, **kwargs):
+    pending = STATE.anchor_latents
+    if pending is None or _PASSTHROUGH.get() is not None:
+        return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
+    STATE.anchor_latents = None
+    anchor = kwargs.get("anchor", args[3] if len(args) > 3 else None)
+    if int(frame_index) != 0 or anchor is not None or not CONFIG.latent_anchor:
+        return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
+    try:
+        native = _signed_float(image if image.ndim == 4 else image.unsqueeze(1))[:, :1]
+        frame = _join_frame_from_latents(self, pending, native)
+        difference = float((frame - native).abs().mean())
+        if difference > _ANCHOR_TOLERANCE:
+            STATE.stats["anchor_native"] += 1
+            _log(f"join frame from latents differs from the video's by {difference:.3f}; "
+                 f"using the video's")
+            return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
+        STATE.stats["anchor_from_latents"] += 1
+        _log(f"join frame built from the carried latents "
+             f"(differs from the video's by {difference * 127.5:.2f} levels)")
+        return _ORIGINALS["add_image_condition"](self, frame, frame_index, *args, **kwargs)
+    except Exception as error:                                   # never break a render
+        STATE.stats["anchor_native"] += 1
+        _log(f"join frame from latents failed, using the video's: {error!r}")
+        return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -2112,6 +2194,7 @@ _TARGETS = (
     ("build_ref2va_packed_sequence", "transformer", "build_ref2va_packed_sequence", False),
     ("audio_decode", "audio_vae", "decode", False),
     ("encode_audio", "pipeline", "_encode_audio", False),
+    ("add_image_condition", "pipeline", "_add_image_condition", False),
 )
 
 _REPLACEMENTS = {
@@ -2122,6 +2205,7 @@ _REPLACEMENTS = {
     "build_ref2va_packed_sequence": "_patched_build_ref2va_packed_sequence",
     "audio_decode": "_patched_audio_decode",
     "encode_audio": "_patched_encode_audio",
+    "add_image_condition": "_patched_add_image_condition",
 }
 
 
@@ -2282,6 +2366,9 @@ def _install():
         _log("audio bindings absent, carrying video latents only")
     if "build_ref2va_packed_sequence" not in available:
         _log("Ref2VA builder absent, plain sliding windows only")
+    if "add_image_condition" not in available:
+        CONFIG.latent_anchor = False
+        _log("image-condition binding absent, the join frame stays Wan2GP's")
 
     # Apply as a unit: any failure rolls the whole thing back rather than
     # leaving some bindings patched and others not.

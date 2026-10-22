@@ -27,7 +27,8 @@ NOTE = "Don't enable together with Sliding Window Latents or Sliding Window Anch
 
 # Anything the panel exposes.  Env vars still set the initial value; the saved
 # settings file wins over them once the panel has been used.
-TOGGLES = ("enable", "video", "audio", "fix_coords", "colour", "save", "restore")
+TOGGLES = ("enable", "video", "audio", "fix_coords", "colour", "save", "restore",
+           "latent_anchor")
 STORE_LIMITS = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
 
 
@@ -94,6 +95,11 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     label="Carried latents",
                     info="How much of the previous window is handed on: "
                          "7 = 22 frames, 12 = 39, 17 = 56.")
+                anchor_cb = gr.Checkbox(
+                    value=patches.CONFIG.latent_anchor, label="Join frame from latents",
+                    info="Experimental. Builds the frame each window and each Continue "
+                         "Video starts from out of the carried latents, not the finished "
+                         "or saved video.")
 
                 with gr.Accordion("Colour hold", open=True):
                     colour_cb = gr.Checkbox(
@@ -152,10 +158,10 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                 timer = gr.Timer(3)
 
                 controls = [enable_cb, video_cb, audio_cb, audio_ctx_dd, latents_dd,
-                            colour_cb, colour_axes_cb, colour_strength_sl,
+                            anchor_cb, colour_cb, colour_axes_cb, colour_strength_sl,
                             save_cb, scope_dd, restore_cb, limit_dd, coords_cb]
 
-                def _apply(enable, video, audio, audio_context, carried,
+                def _apply(enable, video, audio, audio_context, carried, latent_anchor,
                            colour, colour_axes, colour_strength,
                            save, scope, restore, limit, fix_coords):
                     patches.CONFIG.enable = bool(enable)
@@ -163,6 +169,7 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     patches.CONFIG.audio = bool(audio)
                     patches.CONFIG.audio_context = float(audio_context)
                     patches.CONFIG.latents = int(carried)
+                    patches.CONFIG.latent_anchor = bool(latent_anchor)
                     patches.CONFIG.colour = bool(colour)
                     patches.CONFIG.colour_axes = tuple(a for a in (colour_axes or ()) if a in patches._COLOUR_AXES)
                     patches.CONFIG.colour_strength = float(colour_strength)
@@ -265,13 +272,21 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                    and not patches.CONFIG.colour_axes else "")
         return (f"Windows carried: **{stats.get('engaged', 0)}** "
                 f"&nbsp;·&nbsp; re-encoded: **{stats.get('fell_back', 0)}** "
-                f"&nbsp;·&nbsp; audio carried: **{stats.get('audio_engaged', 0)}**  \n"
+                f"&nbsp;·&nbsp; audio carried: **{stats.get('audio_engaged', 0)}**"
+                f"{self._anchor_text()}  \n"
                 f"Colour held: **{stats.get('colour_applied', 0)}** window(s){warning}  \n"
                 f"{self._savings_text()}  \n"
                 f"Saved: **{stats.get('saved', 0)}** &nbsp;·&nbsp; not saved: "
                 f"**{stats.get('save_skipped', 0)}** &nbsp;·&nbsp; restored for "
                 f"Continue Video: **{stats.get('restored', 0)}**  \n"
                 f"Last: {patches.STATE.last_message}")
+
+    def _anchor_text(self):
+        if not patches.CONFIG.latent_anchor:
+            return ""
+        stats = patches.STATE.stats
+        return (f"  \nJoin frames from latents: **{stats.get('anchor_from_latents', 0)}** "
+                f"&nbsp;·&nbsp; from the video: **{stats.get('anchor_native', 0)}**")
 
     def _entry_choices(self):
         """(label, sha) for the saved entries, newest first."""
