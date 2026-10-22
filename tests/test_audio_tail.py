@@ -51,6 +51,7 @@ for name in ("colour", "store", "patches"):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 patches = sys.modules["h3lc_tail.patches"]
+P = patches
 patches._log = lambda message: None
 
 HOP = 800
@@ -96,6 +97,22 @@ _, waveform, cached = run(640, 600)
 check("a difference too big to be a tail is not trimmed", cached[0, 0, -1] == 639)
 print()
 
+print("with Discard Last Frames 4 (120 frames at 24 fps, join at frame 116)")
+token = P.JOB.set({"discard_last_frames": 4})
+patches.STATE.plan = {"usable": True, "audio_target_latents": 200, "target_frames": 120, "fps": 24.0}
+latents = torch.from_numpy(np.arange(205, dtype=np.float32).reshape(1, 1, 205).repeat(2, 1))
+waveform = decode(latents)
+patches._ORIGINALS["audio_decode"] = lambda self, lat, *a, **k: waveform
+patches._patched_audio_decode(None, latents)
+cached = np.asarray(patches.STATE.audio_latents.a)
+check("cached audio ends at the latent nearest the join (193 1/3 -> 193)", cached[0, 0, -1] == 192,
+      str(cached[0, 0, -1]))
+join_sample = int(round(116 / 24 * 40 * HOP))
+check("the signature ends at the exact join sample",
+      same(patches.STATE.audio_signature, patches._audio_signature(waveform[..., :join_sample])))
+P.JOB.reset(token)
+print()
+
 print("saved entries")
 patches.STORE = types.SimpleNamespace(touch=lambda sha: None)
 manifest = {"total_latents": 37, "expected_latents": 37, "video_name": "x"}
@@ -109,6 +126,12 @@ check("an entry saved before 2.0.1 restores its video", patches.STATE.latents is
 check("but not its audio", patches.STATE.audio_latents is None)
 patches._seed_from_entry((dict(manifest, audio_ends_at_join=True), arrays), "b" * 64)
 check("a 2.0.1 entry restores its audio", patches.STATE.audio_latents is not None)
+patches.STATE.audio_latents = None
+patches._seed_from_entry((dict(manifest, audio_ends_at_join=True, discard_last_frames=4), arrays), "c" * 64)
+check("a discard entry from before 2.4.0 does not restore its audio", patches.STATE.audio_latents is None)
+patches._seed_from_entry((dict(manifest, audio_ends_at_join=True, discard_last_frames=4,
+                               audio_cut_at_discard=True), arrays), "d" * 64)
+check("a 2.4.0 discard entry restores its audio", patches.STATE.audio_latents is not None)
 print()
 
 if FAILURES:

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.4.0
+
+- **Audio carry works with Discard Last Frames 4.** The cached audio is cut at
+  the audio latent nearest the join (at most half a latent, 12 ms, out; H3's
+  own window lengths are already rounded the same way), and its signature is
+  taken at the exact join sample. Before, audio fell back to Wan2GP's own
+  0.75 s continuation in this mode.
+- Saved latents from 2.2.0-2.3.1 made with frames discarded keep their video
+  but re-encode their audio, which runs past the join.
+- **Fixed:** with Discard Last Frames set, the colour hold looked for a cut at
+  the join against the previous window's last decoded frame, which was
+  discarded and never shown. The cut test allows for motion (six times the
+  usual frame change), so steady movement passed, but a fast or jerky shot
+  could read as a cut and restart the hold's reference. It now compares
+  against the frame actually at the join.
+
 ## 2.3.1
 
 - Join frame from latents: the safety margin is tightened from 0.8 to 0.5.

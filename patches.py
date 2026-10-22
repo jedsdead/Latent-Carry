@@ -453,7 +453,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -725,8 +725,14 @@ def _measure_colour(decoded):
     frames = int(decoded.shape[2])
     stats = _frame_colour_stats(decoded)
     prints = [_fingerprint(decoded[0, :, i]) for i in range(frames)]
-    previous = STATE.signatures[-1] if (STATE.signatures is not None
-                                        and STATE.source_generation == STATE.generation - 1) else None
+    # The previous window's frame at the join: its last decoded frame, or with
+    # Discard Last Frames the one that many frames earlier - the discarded
+    # frames were never shown, and comparing against them reads motion as a cut.
+    shown_last = -1 - int(STATE.source_discard or 0)
+    previous = (STATE.signatures[shown_last]
+                if (STATE.signatures is not None
+                    and STATE.source_generation == STATE.generation - 1
+                    and STATE.signatures.shape[0] >= -shown_last) else None)
     at_join, cuts = _find_cuts(prints, previous)
     opening = lambda a, b: stats[a:min(b, a + _LOCK_REFERENCE_FRAMES)]
 
@@ -967,11 +973,26 @@ def _patched_audio_decode(self, latents, *args, **kwargs):
         count = int(latents.shape[-1])
         overrun = _audio_overrun(count)
         end = count - overrun
+        join_sample = int(round(int(waveform.shape[-1]) * end / count)) if count else 0
+        discard = _job_discard()
+        plan = STATE.plan or {}
+        window_frames, fps = plan.get("target_frames"), plan.get("fps")
+        if discard and window_frames is not None and fps and count:
+            # Discard Last Frames moves the join back into the window.  Cut the
+            # cached audio at the latent nearest to it (at most half a latent
+            # out, as H3's own window lengths already are) and take the
+            # signature at the exact join sample.
+            seconds = (int(window_frames) - discard) / float(fps)
+            nearest = int(round(seconds * _audio_latent_fps()))
+            if not 0 < nearest <= end:
+                raise ValueError(f"join at latent {nearest} lies outside 1..{end}")
+            end = nearest
+            join_sample = int(round(seconds * _audio_latent_fps() * int(waveform.shape[-1]) / count))
         tail = latents[..., :end][..., -_MAX_CACHED_AUDIO_LATENTS:].detach().to(torch.float32).cpu()
         at_join = waveform
-        if overrun and count:
+        if (overrun or discard) and count:
             # Signature of the half second ending at the join, not at the tail.
-            at_join = waveform[..., :int(round(int(waveform.shape[-1]) * end / count))]
+            at_join = waveform[..., :join_sample]
         with STATE.lock:
             STATE.audio_latents = tail
             STATE.audio_signature = _audio_signature(at_join)
@@ -1033,12 +1054,6 @@ def _patched_encode_audio(self, waveform, *args, **kwargs):
         _log(f"re-encoding continuation audio ({reason})")
         return native
 
-    if STATE.source_discard:
-        # Discarded frames rarely land on the 40/s audio grid (4 frames at 24 fps
-        # are 6 2/3 latents), so the cached audio cannot be cut at the join.
-        _log(f"re-encoding continuation audio (Discard Last Frames "
-             f"{STATE.source_discard} does not end on an audio latent)")
-        return native
 
     matched, reason = _audio_matches(signature, _audio_signature(waveform))
     if not matched:
@@ -1421,6 +1436,7 @@ def _plan_window(pipeline, args, kwargs):
             # _encode_audio call of this window is something else entirely.
             "continuation_audio": bool(count) and values.get("input_waveform") is not None,
             # Audio latents the window's frames span; any more is Wan2GP's tail.
+            "target_frames": int(aligned),
             "audio_target_latents": (int(round(aligned / geometry["fps"] * _audio_latent_fps()))
                                      if geometry.get("fps") else None),
             "expected_latents": video_latent_frames(aligned)}
@@ -1726,6 +1742,11 @@ def _seed_from_entry(found, sha, note=""):
         STATE.total_latents = int(manifest["total_latents"])
         STATE.expected_latents = _int_or_none(manifest.get("expected_latents"))
         STATE.source_discard = _int_or_none(manifest.get("discard_last_frames")) or 0
+        if (audio is not None and (_int_or_none(manifest.get("discard_last_frames")) or 0)
+                and not manifest.get("audio_cut_at_discard")):
+            # Saved by 2.2.0-2.3.1 with frames discarded: its audio runs past the join.
+            audio = None
+            _log("saved audio latents run past the join (saved before 2.4.0), re-encoding the audio")
         if audio is not None and not manifest.get("audio_ends_at_join"):
             # Saved before 2.0.1: with Wan2GP v18.19+ its audio may run ~125 ms
             # past the join.  The video is still used; the audio is re-encoded.
@@ -1859,6 +1880,7 @@ def snapshot_for_export(tensor, fps):
                 "carried_from": STATE.restored,
                 "audio_ends_at_join": True,
                 "discard_last_frames": int(discard),
+                "audio_cut_at_discard": True,
                 "lock_reference": STATE.lock_reference}
     return {"arrays": arrays, "manifest": manifest}, None
 
