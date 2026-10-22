@@ -174,10 +174,10 @@ _AUDIO_LATENT_FPS_FALLBACK = 40.0
 _MAX_AUDIO_TAIL_LATENTS = 16
 _CLIP_LENGTH = 17                   # H3 window quantum
 _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
-# How far the latent-built join frame may differ from Wan2GP's own (mean absolute
-# difference on the signed [-1, 1] scale) before it is distrusted.  Rounding and
-# video compression stay well under this; a different frame does not.
-_ANCHOR_TOLERANCE = 0.12
+# How far the previous window's own latent for the join frame may sit from
+# Wan2GP's encode of the finished frame (mean absolute difference, in the
+# normalised latent space) before it is distrusted as a different picture.
+_ANCHOR_TOLERANCE = 0.8
 # Discard Last Frames that moves the join onto a latent boundary: a window's
 # last 5 frames come from its last two latents (1 + 4 frames), the decoder's
 # unblended look-ahead.  Dropping the 4 puts the join on the 1-frame latent,
@@ -258,8 +258,8 @@ class _Config:
             self.audio_tolerance = 0.15
         # Search a run of frames for the join rather than testing one offset.
         self.align_search = _flag("H3LC_ALIGN_SEARCH", "1")
-        # Build the join frame H3 pins at frame 0 from the carried latents
-        # instead of from the finished (8-bit, or for Continue Video, compressed)
+        # In the takeover layout the join is a 1-frame latent of the previous
+        # window: pin that latent at frame 0 instead of re-encoding the finished
         # frame.  Off by default while it is being evaluated.
         self.latent_anchor = _flag("H3LC_LATENT_ANCHOR", "0")
         # With Wan2GP's Discard Last Frames at 4, decode each new window together
@@ -423,6 +423,8 @@ class _State:
         # Carried latents waiting to become this stage's join frame; set when
         # the history block is carried, consumed by the next frame-0 condition.
         self.anchor_latents = None
+        # The previous window's 1-frame latent for the join (takeover layout).
+        self.join_latent = None
         # Name of the source video whose saved latents seeded this job, if any.
         self.restored = None
         # Measured cost of one native history encode, for the panel's estimate.
@@ -451,7 +453,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -1440,6 +1442,7 @@ def _patched_generate(self, *args, **kwargs):
     STATE.anchor_latents = None
     STATE.takeover = False
     STATE.takeover_prefix = None
+    STATE.join_latent = None
     if ON_GENERATE is not None:
         try:
             ON_GENERATE()
@@ -1892,6 +1895,7 @@ def _take_cached(history_video):
         discard = int(STATE.source_discard or 0)
 
     STATE.takeover = False
+    STATE.join_latent = None
     if latents is None:
         return None, "no cached latents"
     if source != generation - 1:
@@ -1946,6 +1950,7 @@ def _take_cached(history_video):
         if total is not None and (total - 2 - carried) % _LATENT_PERIOD:
             return None, f"slice would start at latent {total - 2 - carried}, off phase"
         STATE.takeover = True
+        STATE.join_latent = latents[:, :, -2:-1].clone()
         return latents[:, :, -(carried + 2):-2].clone(), None
 
     if wanted % _LATENT_PERIOD != _PHASE_RESIDUE:
@@ -2028,10 +2033,10 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     if STATE.takeover:
         STATE.stats["takeover"] += 1
         STATE.takeover_prefix = latents
-    if CONFIG.latent_anchor:
+    if CONFIG.latent_anchor and STATE.takeover and STATE.join_latent is not None:
         # pipeline.generate pins the join frame right after the history block:
         # add_image_condition(prepare_stage_video(continuation[:, -1:]), 0).
-        STATE.anchor_latents = latents
+        STATE.anchor_latents = STATE.join_latent
     STATE.stats["engaged"] += 1
     _log(f"carried {latents.shape[2]} latents from the previous window "
          + ("(takeover: the join is on a latent boundary, layout as Wan2GP's own)"
@@ -2041,42 +2046,15 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     return None                      # matches stock; see the docstring above
 
 
-def _signed_float(video):
-    """Wan2GP hands frames over as signed floats or as uint8; return signed floats."""
-    video = video.detach()
-    if video.dtype == torch.uint8:
-        return video.to(torch.float32).div(127.5).sub(1.0)
-    return video.to(torch.float32)
-
-
-def _join_frame_from_latents(pipeline, latents, like):
-    """The last frame of the carried latents, decoded in full precision.
-
-    The carried slice starts on one of the decoder's 5-latent chunk boundaries
-    (_take_cached refuses any other), so decoding it on its own reproduces the
-    tail of the window's own decode exactly; only the 8-bit rounding of the
-    finished frame (and, for Continue Video, the file's compression) is left
-    out.  Whatever decoder is loaded is used, as for the video itself, and the
-    frame is resized exactly as prepare_stage_video resizes the native one.
-    """
-    vae = pipeline.vae
-    device = getattr(pipeline, "device", None)
-    z = latents.to(device=device) if device is not None else latents
-    token = _PASSTHROUGH.set(True)          # not a window: no capture, no colour hold
-    try:
-        decoded = _ORIGINALS["decode"](vae, z.to(vae._model_dtype))
-    finally:
-        _PASSTHROUGH.reset(token)
-    frame = decoded[0, :, -1:].to(torch.float32).cpu().clamp_(-1.0, 1.0)
-    height, width = int(like.shape[-2]), int(like.shape[-1])
-    if tuple(frame.shape[-2:]) != (height, width):
-        frame = torch.nn.functional.interpolate(
-            frame.permute(1, 0, 2, 3), size=(height, width), mode="bicubic",
-            align_corners=False, antialias=True).permute(1, 0, 2, 3).clamp_(-1.0, 1.0)
-    return frame
-
-
 def _patched_add_image_condition(self, image, frame_index, *args, **kwargs):
+    """Pin the previous window's own join latent instead of re-encoding the frame.
+
+    Only in the takeover layout, where the join is the previous window's
+    1-frame latent: the same kind of latent H3 makes for a pinned frame, so it
+    can stand in for the encode with no decode, rounding or re-encode between.
+    The native encode still runs, for the comparison that guards against a
+    wrong pairing; everything else _add_image_condition does is left to it.
+    """
     pending = STATE.anchor_latents
     if pending is None or _PASSTHROUGH.get() is not None:
         return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
@@ -2084,23 +2062,42 @@ def _patched_add_image_condition(self, image, frame_index, *args, **kwargs):
     anchor = kwargs.get("anchor", args[3] if len(args) > 3 else None)
     if int(frame_index) != 0 or anchor is not None or not CONFIG.latent_anchor:
         return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
-    try:
-        native = _signed_float(image if image.ndim == 4 else image.unsqueeze(1))[:, :1]
-        frame = _join_frame_from_latents(self, pending, native)
-        difference = float((frame - native).abs().mean())
-        if difference > _ANCHOR_TOLERANCE:
+
+    missing = object()
+    shadowed = self.__dict__.get("_encode_video", missing)
+    encode = self._encode_video
+
+    def encode_join(video, *a, **k):
+        native = encode(video, *a, **k)
+        try:
+            if tuple(native.shape) != tuple(pending.shape):
+                STATE.stats["anchor_native"] += 1
+                _log(f"join latent {tuple(pending.shape)} does not fit the frame's "
+                     f"{tuple(native.shape)}; using Wan2GP's encode")
+                return native
+            difference = float((pending.to(native.dtype) - native).abs().mean())
+            if difference > _ANCHOR_TOLERANCE:
+                STATE.stats["anchor_native"] += 1
+                _log(f"join latent differs from the frame's encode by {difference:.3f}; "
+                     f"using Wan2GP's encode")
+                return native
+            STATE.stats["anchor_from_latents"] += 1
+            _log(f"pinned the previous window's own latent for the join frame "
+                 f"(differs from the re-encode by {difference:.3f})")
+            return pending.to(dtype=native.dtype).clone()
+        except Exception as error:                               # never break a render
             STATE.stats["anchor_native"] += 1
-            _log(f"join frame from latents differs from the video's by {difference:.3f}; "
-                 f"using the video's")
-            return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
-        STATE.stats["anchor_from_latents"] += 1
-        _log(f"join frame built from the carried latents "
-             f"(differs from the video's by {difference * 127.5:.2f} levels)")
-        return _ORIGINALS["add_image_condition"](self, frame, frame_index, *args, **kwargs)
-    except Exception as error:                                   # never break a render
-        STATE.stats["anchor_native"] += 1
-        _log(f"join frame from latents failed, using the video's: {error!r}")
+            _log(f"join latent failed, using Wan2GP's encode: {error!r}")
+            return native
+
+    self._encode_video = encode_join
+    try:
         return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
+    finally:
+        if shadowed is missing:
+            self.__dict__.pop("_encode_video", None)
+        else:
+            self._encode_video = shadowed
 
 
 # --------------------------------------------------------------------------

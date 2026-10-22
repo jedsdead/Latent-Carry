@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Join frame from latents: the frame-0 condition rebuilt from the carried latents.
+"""Join frame from latents: pin the previous window's own latent for the join.
 
-Runs the real patches.py on the numpy torch shim, with a stand-in decoder and a
-recorder in place of the pipeline's _add_image_condition.
+In the takeover layout (Discard Last Frames 4) the join is the previous
+window's 1-frame latent.  Runs the real patches.py on the numpy torch shim,
+with a stand-in pipeline whose _add_image_condition encodes the frame through
+self._encode_video, as Wan2GP's does.
 
 WHAT IS BEING CHECKED
 ---------------------
-1. With the option on and a carried history pending, the join frame handed on
-   is the last frame of the decoded carried latents, and the pending latents
-   are used once only.
-2. A decoder that outputs twice the size (the x2 VAE upsampler) is resized to
-   the native frame's size.
-3. With the option off, for a frame other than 0, for an anchored condition,
-   or with nothing pending, Wan2GP's own frame passes through untouched.
-4. A rebuilt frame too different from the video's, or a decode that raises,
-   falls back to the video's frame.
+1. With the option on and a join latent pending, the condition gets that
+   latent instead of the encode, and it is used once.
+2. The pipeline's own _encode_video is back in place afterwards, also when the
+   condition raises.
+3. Frame other than 0, an anchored condition, option off, nothing pending:
+   Wan2GP's encode, untouched.
+4. A latent of the wrong shape, or too far from the encode, falls back.
+5. _take_cached hands over the right latent: the last-but-one of the window.
 
     python tests/test_latent_anchor.py
 """
@@ -49,86 +50,96 @@ for name in ("colour", "store", "patches"):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-patches = sys.modules["h3lc_anchor.patches"]
-patches._log = lambda message: None
+P = sys.modules["h3lc_anchor.patches"]
+P._log = lambda message: None
 
-
-def box_resize(x, size, **_):
-    a = np.asarray(x.a)
-    n, c, h, w = a.shape
-    fh, fw = h // size[0], w // size[1]
-    return torch.from_numpy(a.reshape(n, c, size[0], fh, size[1], fw).mean(axis=(3, 5)).astype(np.float32))
-
-
-torch.nn.functional.interpolate = box_resize
-
-H, W = 8, 12
-rng = np.random.default_rng(1)
-LAST = rng.uniform(-0.9, 0.9, (3, 1, H, W)).astype(np.float32)
-CALLS = []
-SCALE = [1]
+rng = np.random.default_rng(5)
+SHAPE = (1, 24, 1, 2, 3)
+ENCODED = rng.standard_normal(SHAPE).astype(np.float32)
+OWN = (ENCODED + 0.1 * rng.standard_normal(SHAPE)).astype(np.float32)   # same picture
+RECEIVED = []
 RAISE = [False]
 
 
-def fake_decode(vae, z, *args, **kwargs):
+class Pipeline:
+    def _encode_video(self, video, keep_all_latents=False):
+        return torch.from_numpy(ENCODED.copy())
+
+
+def fake_add_image_condition(self, image, frame_index, presentation, visual_latents, keyframes,
+                             anchor=None, timestep=None):
+    latent = self._encode_video(image)
+    RECEIVED.append(np.asarray(latent.a).copy())
     if RAISE[0]:
-        raise RuntimeError("decoder unavailable")
-    s = SCALE[0]
-    frames = rng.uniform(-1, 1, (1, 3, 22, H * s, W * s)).astype(np.float32)
-    frames[0, :, -1:] = np.repeat(np.repeat(LAST, s, axis=2), s, axis=3)
-    return torch.from_numpy(frames)
+        raise RuntimeError("boom")
 
 
-patches._ORIGINALS["decode"] = fake_decode
-patches._ORIGINALS["add_image_condition"] = (
-    lambda self, image, frame_index, *a, **k: CALLS.append((np.asarray(image.a).copy(), frame_index, k)))
-pipeline = types.SimpleNamespace(vae=types.SimpleNamespace(_model_dtype=torch.float32), device=None)
-carried = torch.from_numpy(np.zeros((1, 24, 7, H, W), np.float32))
+P._ORIGINALS["add_image_condition"] = fake_add_image_condition
+pipe = Pipeline()
+frame = torch.from_numpy(np.zeros((3, 1, 32, 48), np.float32))
 
 
-def video_frame(offset=0.0):
-    return torch.from_numpy((LAST + np.float32(offset)).clip(-1, 1))
-
-
-def join(frame, frame_index=0, anchor=None, pending=True):
-    CALLS.clear()
-    patches.STATE.anchor_latents = carried if pending else None
-    patches._patched_add_image_condition(pipeline, frame, frame_index, [], [], [],
-                                         anchor=anchor, timestep=None)
-    return CALLS[0][0]
+def join(pending=OWN, frame_index=0, anchor=None):
+    RECEIVED.clear()
+    P.STATE.anchor_latents = torch.from_numpy(pending.copy()) if pending is not None else None
+    P._patched_add_image_condition(pipe, frame, frame_index, [], [], [], anchor=anchor, timestep=None)
+    return RECEIVED[0]
 
 
 print("option on")
-patches.CONFIG.latent_anchor = True
-native = video_frame(0.004)            # the video's frame: the same picture, 8-bit rounded
-used = join(native)
-check("the join frame is the decoded carried latents' last frame", np.allclose(used, LAST))
-check("the pending latents are used once", patches.STATE.anchor_latents is None)
-check("counted", patches.STATE.stats["anchor_from_latents"] == 1)
-SCALE[0] = 2
-used = join(native)
-check("a x2 decoder's frame is resized to the video frame's size",
-      used.shape == LAST.shape and np.allclose(used, LAST, atol=1e-5), str(used.shape))
-SCALE[0] = 1
+P.CONFIG.latent_anchor = True
+check("the join latent replaces the encode", np.allclose(join(), OWN))
+check("used once", P.STATE.anchor_latents is None)
+check("the pipeline's own _encode_video is back", "_encode_video" not in pipe.__dict__
+      and np.allclose(np.asarray(pipe._encode_video(frame).a), ENCODED))
+RAISE[0] = True
+try:
+    join()
+except RuntimeError:
+    pass
+RAISE[0] = False
+check("and back after an error", "_encode_video" not in pipe.__dict__)
 print()
 
 print("left alone")
-check("frame index other than 0", np.array_equal(join(native, frame_index=40), np.asarray(native.a)))
-check("an anchored condition", np.array_equal(join(native, anchor="frame"), np.asarray(native.a)))
-check("nothing pending", np.array_equal(join(native, pending=False), np.asarray(native.a)))
-patches.CONFIG.latent_anchor = False
-check("option off", np.array_equal(join(native), np.asarray(native.a)))
-patches.CONFIG.latent_anchor = True
+check("frame other than 0", np.allclose(join(frame_index=40), ENCODED))
+check("anchored condition", np.allclose(join(anchor="frame"), ENCODED))
+check("nothing pending", np.allclose(join(pending=None), ENCODED))
+P.CONFIG.latent_anchor = False
+check("option off", np.allclose(join(), ENCODED))
+P.CONFIG.latent_anchor = True
 print()
 
 print("fall backs")
-far = video_frame(0.5)
-check("a different picture keeps the video's frame", np.array_equal(join(far), np.asarray(far.a)))
-RAISE[0] = True
-check("a failed decode keeps the video's frame", np.array_equal(join(native), np.asarray(native.a)))
-RAISE[0] = False
-check("both counted as the video's", patches.STATE.stats["anchor_native"] == 2,
-      str(patches.STATE.stats["anchor_native"]))
+check("wrong shape", np.allclose(join(pending=np.zeros((1, 24, 2, 2, 3), np.float32)), ENCODED))
+check("a different picture", np.allclose(join(pending=rng.standard_normal(SHAPE).astype(np.float32) * 3),
+                                         ENCODED))
+print()
+
+print("which latent")
+TOTAL = 37
+latents = torch.from_numpy(np.broadcast_to(np.arange(TOTAL - 17, TOTAL, dtype=np.float32)
+                                           .reshape(1, 1, 17, 1, 1), (1, 24, 17, 2, 3)).copy())
+frames = [rng.uniform(-1, 1, (3, 32, 48)).astype(np.float32) for _ in range(12)]
+P.STATE.latents = latents
+P.STATE.signatures = torch.stack([P._fingerprint(torch.from_numpy(f)) for f in frames])
+P.STATE.signature = None
+P.STATE.source_generation, P.STATE.generation = 0, 1
+P.STATE.source_window_no, P.STATE.window_no = 1, 2
+P.STATE.usable = True
+P.STATE.total_latents = P.STATE.expected_latents = TOTAL
+P.STATE.source_discard = 4
+P.STATE.plan = {"usable": True, "window_no": 2, "expected_latents": TOTAL}
+P.CONFIG.latents = 7
+video = np.zeros((3, 17, 32, 48), np.float32)
+video[:, -1] = frames[-6]
+block, reason = P._take_cached(torch.from_numpy(video))
+check("the join latent is the window's last-but-one", P.STATE.join_latent is not None
+      and float(np.asarray(P.STATE.join_latent.a)[0, 0, 0, 0, 0]) == TOTAL - 2, str(reason))
+P.STATE.source_discard = 0
+video[:, -1] = frames[-2]
+P._take_cached(torch.from_numpy(video))
+check("none without the discard", P.STATE.join_latent is None)
 print()
 
 if FAILURES:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.3.0
+
+- **Join frame from latents** reworked. It now acts only with Discard Last
+  Frames at 4, where the join is the previous window's 1-frame latent: that
+  latent is pinned as it is, with no decode, rounding or re-encode, in place of
+  Wan2GP's encode of the finished frame. If it does not match the frame's own
+  encode, the encode is used. The 2.1.0 version (decoding the carried latents
+  again) made no measurable difference and is gone.
+
 ## 2.2.0
 
 - **Blend joins** (on by default; works when Wan2GP's Discard Last Frames is 4).

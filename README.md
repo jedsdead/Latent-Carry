@@ -9,7 +9,7 @@ After that, H3's own drift still builds up.
 It also saves each video's last latents, so **Continue Video** on that file picks
 up from the latents too, not from the compressed MP4.
 
-Version 2.2.0 · MIT
+Version 2.3.0 · MIT
 
 ## Install
 
@@ -31,7 +31,7 @@ The **H3 Latent Carry** panel sits just above the Generate button.
 | Audio context (seconds) | How much audio the next window hears. 0 uses Wan2GP's own 0.75 s. |
 | Carried latents | How much of the previous window is handed on: 7 = 22 frames, 12 = 39, 17 = 56. |
 | Blend joins (needs Discard Last Frames = 4) | With Wan2GP's **Discard Last Frames** at 4, each window is decoded together with the end of the previous one, so the join blends like the middle of a clip. Audio then uses Wan2GP's own continuation. |
-| Join frame from latents | Experimental. Builds the frame each window, and each Continue Video, starts from out of the carried latents instead of the finished or saved video. |
+| Join frame from latents | Experimental. With **Discard Last Frames** at 4, pins the previous window's own latent for the join frame instead of re-encoding the finished frame. |
 
 **Colour hold**
 

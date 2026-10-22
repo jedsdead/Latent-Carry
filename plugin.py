@@ -102,9 +102,9 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                          "of a clip.")
                 anchor_cb = gr.Checkbox(
                     value=patches.CONFIG.latent_anchor, label="Join frame from latents",
-                    info="Experimental. Builds the frame each window and each Continue "
-                         "Video starts from out of the carried latents, not the finished "
-                         "or saved video.")
+                    info="Experimental. With Discard Last Frames at 4, pins the previous "
+                         "window's own latent for the join frame instead of re-encoding "
+                         "the finished frame.")
 
                 with gr.Accordion("Colour hold", open=True):
                     colour_cb = gr.Checkbox(
