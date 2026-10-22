@@ -9,7 +9,7 @@ After that, H3's own drift still builds up.
 It also saves each video's last latents, so **Continue Video** on that file picks
 up from the latents too, not from the compressed MP4.
 
-Version 2.5.0 · MIT
+Version 2.6.0 · MIT
 
 ## Install
 
@@ -73,6 +73,11 @@ detail from building up.
   of the join, as H3's own window lengths already do.
 - Colour hold on: all four aspects, strength **1**.
 - Continue Video saving on, *Final video of each job*, and restore on.
+
+With Two Phases, phase 1 carries the previous window's own phase 1 latents and
+phase 2 its full-size ones, so both phases continue from latents. Two Phases
+with Tiling carries in phase 1 only. Keep the resolution a multiple of 64 (x2)
+or 96 (x1.5).
 
 For long videos, fewer and longer windows beat many short ones.
 

@@ -178,6 +178,12 @@ _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
 # Wan2GP's encode of the finished frame (mean absolute difference, in the
 # normalised latent space) before it is distrusted as a different picture.
 _ANCHOR_TOLERANCE = 0.5
+# Two Phases, phase 1: the pinned latent is phase 1's own while the frame it is
+# checked against is the final (phase 2) video scaled down, so the two sit
+# further apart (0.36-0.41 measured, against 0.16-0.35 elsewhere).  The join
+# itself is located beforehand by the fingerprint search; this only rejects a
+# grossly different picture, which lands around 1.0.
+_ANCHOR_TOLERANCE_PHASE_1 = 0.6
 # Discard Last Frames that moves the join onto a latent boundary: a window's
 # last 5 frames come from its last two latents (1 + 4 frames), the decoder's
 # unblended look-ahead.  Dropping the 4 puts the join on the 1-frame latent,
@@ -428,6 +434,12 @@ class _State:
         self.anchor_latents = None
         # The previous window's 1-frame latent for the join (takeover layout).
         self.join_latent = None
+        # Two Phases: the tail of the window's phase 1 latents, taken on their
+        # way into the latent upscaler, so phase 1 of the next window can carry
+        # them as single-phase windows carry theirs.
+        self.p1_latents = None
+        self.p1_generation = None
+        self.p1_stage = False           # this stage carries phase 1 latents
         # Name of the source video whose saved latents seeded this job, if any.
         self.restored = None
         # Measured cost of one native history encode, for the panel's estimate.
@@ -456,7 +468,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -926,6 +938,8 @@ def _patched_decode(self, latents, *args, **kwargs):
             # them or the next window is conditioned on a grade the video no
             # longer has.
             tail = _apply_latent_steps(tail, STATE.colour_step)
+            if STATE.p1_latents is not None and STATE.p1_generation == STATE.generation:
+                STATE.p1_latents = _apply_latent_steps(STATE.p1_latents, STATE.colour_step)
         # Frame -2 of the decoded window is the last frame the next window will
         # hand back as history (continuation[:, -overlap:-1] excludes the join
         # frame itself).  Fingerprinting it lets the next window confirm these
@@ -1169,6 +1183,12 @@ def _audio_extension(native_latents, cached_latents, pipeline=None):
         # at fix_coords, which is not what is holding it.
         _log("extended audio context needs the video carry, which is off "
              "(H3LC_VIDEO=0); using the native audio window")
+        return 0
+    if (STATE.plan or {}).get("tiled_phase_2"):
+        # Phase 2 in tiles carries no video block, so the shift the longer audio
+        # history needs would be missing there.
+        _log("extended audio context is not applied with Two Phases with Tiling; "
+             "using the native audio window")
         return 0
     if STATE.active_latents is None or not CONFIG.fix_coords:
         _log("extended audio context needs the video carry and fix_coords; "
@@ -1447,9 +1467,51 @@ def _plan_window(pipeline, args, kwargs):
             "continuation_audio": bool(count) and values.get("input_waveform") is not None,
             # Audio latents the window's frames span; any more is Wan2GP's tail.
             "target_frames": int(aligned),
+            "tiled_phase_2": _tiled_phase_2(values),
             "audio_target_latents": (int(round(aligned / geometry["fps"] * _audio_latent_fps()))
                                      if geometry.get("fps") else None),
             "expected_latents": video_latent_frames(aligned)}
+
+
+def _tiled_phase_2(values):
+    try:
+        from models.minimax_h3.pipeline import H3_PHASE_2_TILING_FLAG as flag
+    except Exception:
+        flag = "~"
+    try:
+        return int(values.get("guide_phases") or 1) > 1 and flag in str(values.get("video_prompt_type") or "")
+    except (TypeError, ValueError):
+        return False
+
+
+def _capture_phase_1(module, args):
+    """Forward pre-hook on the latent upscaler: keep the tail of phase 1."""
+    if _PASSTHROUGH.get() is not None or not args:
+        return None
+    try:
+        from models.minimax_h3.pipeline import LATENTS_MEAN, LATENTS_STD
+        normalized = args[0]
+        mean = normalized.new_tensor(LATENTS_MEAN, dtype=torch.float32).view(1, -1, 1, 1, 1)
+        std = normalized.new_tensor(LATENTS_STD, dtype=torch.float32).view(1, -1, 1, 1, 1)
+        tail = normalized[:, :, -_cache_depth(normalized.shape[2]):].to(torch.float32)
+        with STATE.lock:
+            STATE.p1_latents = (tail * std + mean).detach().cpu()
+            STATE.p1_generation = STATE.generation
+    except Exception as error:                                   # never break a render
+        _log(f"phase 1 capture failed, phase 1 will re-encode: {error!r}")
+        STATE.p1_latents = None
+    return None
+
+
+def _hook_upscaler(pipeline):
+    upscaler = getattr(pipeline, "latent_upscaler", None)
+    if upscaler is None or getattr(upscaler, "_h3lc_hooked", False):
+        return
+    try:
+        upscaler.register_forward_pre_hook(_capture_phase_1)
+        upscaler._h3lc_hooked = True
+    except Exception as error:
+        _log(f"could not watch the latent upscaler, Two Phases phase 1 will re-encode: {error!r}")
 
 
 def _patched_generate(self, *args, **kwargs):
@@ -1490,6 +1552,7 @@ def _patched_generate(self, *args, **kwargs):
     STATE.audio_encode_calls = 0
     STATE.plan = _plan_window(self, args, kwargs)
     STATE.window_no = STATE.plan.get("window_no")
+    _hook_upscaler(self)
     STATE.stats["windows"] += 1
     if CONFIG.trace:
         _log(f"trace: generate() window={STATE.window_no} "
@@ -1740,9 +1803,13 @@ def _seed_from_entry(found, sha, note=""):
     signature = arrays.get("signature")
     audio = arrays.get("audio")
     audio_signature = arrays.get("audio_signature")
+    video_p1 = arrays.get("video_p1")
     with STATE.lock:
         # Window 0 of this job, as far as every later check is concerned.
         STATE.latents = video
+        STATE.p1_latents = (torch.from_numpy(np.ascontiguousarray(video_p1, dtype=np.float32))
+                            if video_p1 is not None else None)
+        STATE.p1_generation = STATE.generation - 1 if video_p1 is not None else None
         STATE.signatures = signatures
         STATE.signature = (torch.from_numpy(np.ascontiguousarray(signature, dtype=np.float32))
                            if signature is not None else None)
@@ -1871,6 +1938,9 @@ def snapshot_for_export(tensor, fps):
     keep = max(_MAX_CACHED_LATENTS, _carried_count())
     arrays = {"video": latents[:, :, -keep:].detach().cpu().numpy(),
               "signatures": signatures.detach().cpu().numpy()}
+    p1 = STATE.p1_latents
+    if p1 is not None and STATE.p1_generation == generation:
+        arrays["video_p1"] = p1.detach().cpu().numpy()
     if signature is not None:
         arrays["signature"] = signature.detach().cpu().numpy()
     if audio is not None and audio_generation == generation:
@@ -1928,6 +1998,7 @@ def _take_cached(history_video):
 
     STATE.takeover = False
     STATE.join_latent = None
+    STATE.p1_stage = False
     if latents is None:
         return None, "no cached latents"
     if source != generation - 1:
@@ -1946,10 +2017,16 @@ def _take_cached(history_video):
     expected_h = -(-height // _VAE_SPATIAL_FACTOR)
     expected_w = -(-width // _VAE_SPATIAL_FACTOR)
     if latents.shape[-2] != expected_h or latents.shape[-1] != expected_w:
-        # Normal and expected during two-phase pass 1, which runs at a reduced
-        # resolution the cached latents cannot serve.
-        return None, (f"resolution mismatch (cached latent {latents.shape[-2]}x{latents.shape[-1]}, "
-                      f"need {expected_h}x{expected_w} for {height}x{width})")
+        # Two Phases, phase 1: carry the previous window's own phase 1 latents,
+        # which are at this resolution and are where its motion came from.
+        p1 = STATE.p1_latents
+        if (p1 is not None and STATE.p1_generation == source
+                and tuple(p1.shape[-2:]) == (expected_h, expected_w)):
+            latents = p1
+            STATE.p1_stage = True
+        else:
+            return None, (f"resolution mismatch (cached latent {latents.shape[-2]}x{latents.shape[-1]}, "
+                          f"need {expected_h}x{expected_w} for {height}x{width})")
 
     wanted = CONFIG.latents or _DEFAULT_LATENTS
     if discard not in (0, _TAKEOVER_FRAMES):
@@ -2017,9 +2094,9 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     STATE.anchor_latents = None
     STATE.takeover = False
     STATE.takeover_prefix = None
-    # Cleared per window: a stale value would shift the layout for a window
-    # whose audio fell back to the native encode.
-    STATE.audio_extra = 0
+    # audio_extra is cleared per window in generate(), not here: with Two Phases
+    # the audio is encoded once, in phase 1, and phase 2 lays out the same
+    # extended audio history, so it needs the same shift.
     if CONFIG.colour:
         try:
             _colour_seed(video)
@@ -2110,7 +2187,8 @@ def _patched_add_image_condition(self, image, frame_index, *args, **kwargs):
                      f"{tuple(native.shape)}; using Wan2GP's encode")
                 return native
             difference = float((pending.to(native.dtype) - native).abs().mean())
-            if difference > _ANCHOR_TOLERANCE:
+            tolerance = _ANCHOR_TOLERANCE_PHASE_1 if STATE.p1_stage else _ANCHOR_TOLERANCE
+            if difference > tolerance:
                 STATE.stats["anchor_native"] += 1
                 _log(f"join latent differs from the frame's encode by {difference:.3f}; "
                      f"using Wan2GP's encode")
@@ -2443,6 +2521,13 @@ def _preflight():
         if not callable(video_latent_frames) or not callable(_as_video):
             problems.append("pipeline._as_video / pipeline.video_latent_frames "
                             "are not callable")
+
+    # Optional: Two Phases phase 1 carry and the tiling check.  Missing names
+    # only switch those off (the runtime paths fall back on their own).
+    try:
+        from models.minimax_h3.pipeline import LATENTS_MEAN, LATENTS_STD, H3_PHASE_2_TILING_FLAG  # noqa: F401
+    except Exception as error:
+        _log(f"Two Phases helpers not importable ({error!r}); phase 1 will re-encode")
 
     available = {}
     for key, owner_name, attribute, required in _TARGETS:

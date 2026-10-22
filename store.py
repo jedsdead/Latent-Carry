@@ -39,8 +39,8 @@ FORMAT_VERSION = 1
 SUFFIX = ".safetensors"
 MAX_ENTRY_BYTES = 512 * 1024 ** 2       # a real entry is ~5-20 MB; refuse anything absurd
 REQUIRED = ("video", "signatures")
-HALF = ("video", "audio")
-OPTIONAL = ("signature", "audio", "audio_signature")
+HALF = ("video", "video_p1", "audio")
+OPTIONAL = ("signature", "audio", "audio_signature", "video_p1")
 
 _HASH_CACHE = {}                        # (path, size, mtime_ns) -> sha256
 

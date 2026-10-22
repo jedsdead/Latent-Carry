@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.6.0
+
+- **Two Phases: phase 1 now carries too.** Phase 1 is where a window's motion
+  and content are decided, and until now it re-encoded the previous window's
+  frames, scaled down, because the carried latents were full size. Each
+  window's phase 1 latents are now kept on their way into the latent upscaler,
+  and the next window's phase 1 carries them, with Seamless joins (takeover
+  layout and join latent) as in one-phase runs. Phase 2 carries the full-size
+  latents and the blended decode as before. Saved latents keep phase 1's too,
+  for Continue Video.
+- The extended audio context now holds in phase 2: it was reset between the
+  phases, which would have misplaced the longer audio history once phase 1
+  carried. With Two Phases with Tiling the extension is declined, as phase 2
+  has no carried block to shift around it.
+- The join-latent safety margin is 0.6 in phase 1 of Two Phases (0.5
+  elsewhere): phase 1's own latent is checked against the final video scaled
+  down, so the two sit further apart (0.36-0.41 measured).
+
 ## 2.5.0
 
 - **Seamless joins**: one option, on by default, for the blended decode and
