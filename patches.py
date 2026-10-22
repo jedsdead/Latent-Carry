@@ -177,7 +177,7 @@ _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
 # How far the previous window's own latent for the join frame may sit from
 # Wan2GP's encode of the finished frame (mean absolute difference, in the
 # normalised latent space) before it is distrusted as a different picture.
-_ANCHOR_TOLERANCE = 0.8
+_ANCHOR_TOLERANCE = 0.5
 # Discard Last Frames that moves the join onto a latent boundary: a window's
 # last 5 frames come from its last two latents (1 + 4 frames), the decoder's
 # unblended look-ahead.  Dropping the 4 puts the join on the 1-frame latent,
@@ -453,7 +453,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.

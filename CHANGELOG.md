@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.1
+
+- Join frame from latents: the safety margin is tightened from 0.8 to 0.5.
+  Real joins measured 0.16 (static shot) and 0.22 (moving shot); a different
+  picture lands around 1.0.
+
 ## 2.3.0
 
 - **Join frame from latents** reworked. It now acts only with Discard Last
