@@ -261,11 +261,14 @@ class _Config:
         # In the takeover layout the join is a 1-frame latent of the previous
         # window: pin that latent at frame 0 instead of re-encoding the finished
         # frame.  Off by default while it is being evaluated.
-        self.latent_anchor = _flag("H3LC_LATENT_ANCHOR", "0")
+        self.latent_anchor = _flag("H3LC_LATENT_ANCHOR", "1")
         # With Wan2GP's Discard Last Frames at 4, decode each new window together
         # with the carried end of the previous one, so the join is blended the
         # way the middle of a clip is.
         self.takeover = _flag("H3LC_TAKEOVER", "1")
+        # Seamless joins: the panel's one switch over both of the above, which
+        # stay as separate advanced switches for testing.
+        self.seamless = _flag("H3LC_SEAMLESS", "1")
         # Hold each continuous shot to the look of its own opening.  Off by
         # default: a plugin update should not quietly start altering frames.
         self.colour = _flag("H3LC_COLOUR", "0")
@@ -453,7 +456,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -863,7 +866,7 @@ def _joint_decode(vae, latents, args, kwargs):
     """
     prefix = STATE.takeover_prefix
     STATE.takeover_prefix = None
-    if prefix is None or not CONFIG.takeover:
+    if prefix is None or not (CONFIG.seamless and CONFIG.takeover):
         return None
     try:
         expected = (STATE.plan or {}).get("expected_latents")
@@ -1023,7 +1026,7 @@ def _patched_encode_audio(self, waveform, *args, **kwargs):
         return native
 
     STATE.audio_encode_calls += 1
-    if not (CONFIG.enable and CONFIG.audio) or _RIVAL:
+    if _RIVAL or not CONFIG.enable:
         return native
     if STATE.audio_encode_calls != 1:
         # generate() encodes the continuation first; later calls are reference
@@ -1033,6 +1036,9 @@ def _patched_encode_audio(self, waveform, *args, **kwargs):
         # ...but "first call" only means the continuation when this window has a
         # continuation to encode.  Without one, call 1 is a reference clip or the
         # target audio condition, and substituting into either would be wrong.
+        return native
+    if not CONFIG.audio:
+        _log("continuation audio is Wan2GP's own (Carry audio latents is off)")
         return native
 
     with STATE.lock:
@@ -1044,6 +1050,10 @@ def _patched_encode_audio(self, waveform, *args, **kwargs):
         usable = STATE.usable
 
     if cached is None or source != generation - 1 or not usable:
+        reason = ("no audio latents were captured" if cached is None else
+                  f"cached audio is from call {source}, need {generation - 1}"
+                  if source != generation - 1 else "the previous window was not cacheable")
+        _log(f"re-encoding continuation audio ({reason})")
         return native
 
     # The envelope match below cannot carry this on its own: silence matches
@@ -2055,7 +2065,8 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     if STATE.takeover:
         STATE.stats["takeover"] += 1
         STATE.takeover_prefix = latents
-    if CONFIG.latent_anchor and STATE.takeover and STATE.join_latent is not None:
+    if (CONFIG.seamless and CONFIG.latent_anchor and STATE.takeover
+            and STATE.join_latent is not None):
         # pipeline.generate pins the join frame right after the history block:
         # add_image_condition(prepare_stage_video(continuation[:, -1:]), 0).
         STATE.anchor_latents = STATE.join_latent
@@ -2082,7 +2093,8 @@ def _patched_add_image_condition(self, image, frame_index, *args, **kwargs):
         return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
     STATE.anchor_latents = None
     anchor = kwargs.get("anchor", args[3] if len(args) > 3 else None)
-    if int(frame_index) != 0 or anchor is not None or not CONFIG.latent_anchor:
+    if (int(frame_index) != 0 or anchor is not None
+            or not (CONFIG.seamless and CONFIG.latent_anchor)):
         return _ORIGINALS["add_image_condition"](self, image, frame_index, *args, **kwargs)
 
     missing = object()

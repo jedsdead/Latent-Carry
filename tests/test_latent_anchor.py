@@ -108,6 +108,9 @@ check("nothing pending", np.allclose(join(pending=None), ENCODED))
 P.CONFIG.latent_anchor = False
 check("option off", np.allclose(join(), ENCODED))
 P.CONFIG.latent_anchor = True
+P.CONFIG.seamless = False
+check("Seamless joins off", np.allclose(join(), ENCODED))
+P.CONFIG.seamless = True
 print()
 
 print("fall backs")

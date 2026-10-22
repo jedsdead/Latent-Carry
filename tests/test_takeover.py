@@ -155,6 +155,10 @@ P.STATE.takeover_prefix = torch.from_numpy(np.zeros((1, 24, 5, H, W), np.float32
 P.CONFIG.takeover = False
 check("option off decodes normally", P._joint_decode(None, window, (), {}) is None)
 P.CONFIG.takeover = True
+P.CONFIG.seamless = False
+P.STATE.takeover_prefix = torch.from_numpy(np.zeros((1, 24, 5, H, W), np.float32))
+check("Seamless joins off decodes normally", P._joint_decode(None, window, (), {}) is None)
+P.CONFIG.seamless = True
 check("nothing pending decodes normally", P._joint_decode(None, window, (), {}) is None)
 print()
 

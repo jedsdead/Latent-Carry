@@ -28,7 +28,10 @@ NOTE = "Don't enable together with Sliding Window Latents or Sliding Window Anch
 # Anything the panel exposes.  Env vars still set the initial value; the saved
 # settings file wins over them once the panel has been used.
 TOGGLES = ("enable", "video", "audio", "fix_coords", "colour", "save", "restore",
-           "latent_anchor", "takeover")
+           "seamless")
+# The two parts of Seamless joins are comparison switches: they are not saved,
+# so every start has both on and a test left switched off cannot linger.
+SESSION_ONLY = ("takeover", "latent_anchor")
 STORE_LIMITS = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
 
 
@@ -95,16 +98,12 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     label="Carried latents",
                     info="How much of the previous window is handed on: "
                          "7 = 22 frames, 12 = 39, 17 = 56.")
-                takeover_cb = gr.Checkbox(
-                    value=patches.CONFIG.takeover, label="Blend joins (needs Discard Last Frames = 4)",
-                    info="With Wan2GP's Discard Last Frames at 4, each window is decoded together "
-                         "with the end of the previous one, so the join blends like the middle "
-                         "of a clip.")
-                anchor_cb = gr.Checkbox(
-                    value=patches.CONFIG.latent_anchor, label="Join frame from latents",
-                    info="Experimental. With Discard Last Frames at 4, pins the previous "
-                         "window's own latent for the join frame instead of re-encoding "
-                         "the finished frame.")
+                seamless_cb = gr.Checkbox(
+                    value=patches.CONFIG.seamless,
+                    label="Seamless joins (needs Discard Last Frames = 4)",
+                    info="Set Wan2GP's Discard Last Frames to 4. Each window then continues "
+                         "from the previous one's own latent for the join frame and is decoded "
+                         "together with its end, so the join blends like the middle of a clip.")
 
                 with gr.Accordion("Colour hold", open=True):
                     colour_cb = gr.Checkbox(
@@ -156,6 +155,12 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     coords_cb = gr.Checkbox(
                         value=patches.CONFIG.fix_coords, label="Coordinate correction",
                         info="Keep on. Off is only for comparison.")
+                    takeover_cb = gr.Checkbox(
+                        value=patches.CONFIG.takeover, label="Seamless joins: blended decode",
+                        info="Keep on. Off is only for comparison.")
+                    anchor_cb = gr.Checkbox(
+                        value=patches.CONFIG.latent_anchor, label="Seamless joins: join frame from latents",
+                        info="Keep on. Off is only for comparison.")
 
                 status_md = gr.Markdown(self._status_text())
                 gr.Markdown(NOTE)
@@ -163,17 +168,20 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                 timer = gr.Timer(3)
 
                 controls = [enable_cb, video_cb, audio_cb, audio_ctx_dd, latents_dd,
-                            takeover_cb, anchor_cb, colour_cb, colour_axes_cb, colour_strength_sl,
-                            save_cb, scope_dd, restore_cb, limit_dd, coords_cb]
+                            seamless_cb, colour_cb, colour_axes_cb, colour_strength_sl,
+                            save_cb, scope_dd, restore_cb, limit_dd, coords_cb,
+                            takeover_cb, anchor_cb]
 
-                def _apply(enable, video, audio, audio_context, carried, takeover, latent_anchor,
+                def _apply(enable, video, audio, audio_context, carried, seamless,
                            colour, colour_axes, colour_strength,
-                           save, scope, restore, limit, fix_coords):
+                           save, scope, restore, limit, fix_coords,
+                           takeover, latent_anchor):
                     patches.CONFIG.enable = bool(enable)
                     patches.CONFIG.video = bool(video)
                     patches.CONFIG.audio = bool(audio)
                     patches.CONFIG.audio_context = float(audio_context)
                     patches.CONFIG.latents = int(carried)
+                    patches.CONFIG.seamless = bool(seamless)
                     patches.CONFIG.takeover = bool(takeover)
                     patches.CONFIG.latent_anchor = bool(latent_anchor)
                     patches.CONFIG.colour = bool(colour)
@@ -289,14 +297,16 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
 
     def _anchor_text(self):
         stats = patches.STATE.stats
-        text = ""
-        if stats.get("takeover", 0) or stats.get("joint_decode", 0):
-            text += (f"  \nJoins on a latent boundary: **{stats.get('takeover', 0)}** "
-                     f"&nbsp;·&nbsp; blended: **{stats.get('joint_decode', 0)}**")
-        if not patches.CONFIG.latent_anchor:
-            return text
-        return text + (f"  \nJoin frames from latents: **{stats.get('anchor_from_latents', 0)}** "
-                f"&nbsp;·&nbsp; from the video: **{stats.get('anchor_native', 0)}**")
+        if not patches.CONFIG.seamless:
+            return ""
+        joins = stats.get("takeover", 0)
+        if not joins:
+            if stats.get("engaged", 0):
+                return "  \nSeamless joins: **waiting** - set Discard Last Frames to 4"
+            return ""
+        return (f"  \nSeamless joins: **{joins}** &nbsp;·&nbsp; blended: "
+                f"**{stats.get('joint_decode', 0)}** &nbsp;·&nbsp; join latent pinned: "
+                f"**{stats.get('anchor_from_latents', 0)}**")
 
     def _entry_choices(self):
         """(label, sha) for the saved entries, newest first."""
@@ -391,6 +401,9 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
     # ------------------------------------------------------------------ #
 
     def _load_settings(self):
+        # Session-only switches start from their defaults on every start.
+        patches.CONFIG.takeover = patches._flag("H3LC_TAKEOVER", "1")
+        patches.CONFIG.latent_anchor = patches._flag("H3LC_LATENT_ANCHOR", "1")
         try:
             if not os.path.isfile(self._settings_path):
                 return

@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.5.0
+
+- **Seamless joins**: one option, on by default, for the blended decode and
+  the join frame from latents. Both need Wan2GP's Discard Last Frames at 4;
+  the panel says so when windows are carried without it. The two parts stay
+  under Advanced, on, for comparison only. In tests the new joins also kept
+  fast shots continuous where the old ones sometimes cut to a new angle, in
+  sliding windows and in Continue Video.
+- The two Advanced switches are not saved: every start has both on, so a
+  comparison left switched off cannot linger.
+- The console now says when continuation audio is Wan2GP's own (Carry audio
+  latents off) and why carried audio was not used, instead of saying nothing.
+
 ## 2.4.0
 
 - **Audio carry works with Discard Last Frames 4.** The cached audio is cut at
