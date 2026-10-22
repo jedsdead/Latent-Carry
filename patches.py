@@ -178,6 +178,12 @@ _COLOUR_AXES = ("brightness", "contrast", "saturation", "cast")
 # difference on the signed [-1, 1] scale) before it is distrusted.  Rounding and
 # video compression stay well under this; a different frame does not.
 _ANCHOR_TOLERANCE = 0.12
+# Discard Last Frames that moves the join onto a latent boundary: a window's
+# last 5 frames come from its last two latents (1 + 4 frames), the decoder's
+# unblended look-ahead.  Dropping the 4 puts the join on the 1-frame latent,
+# where a new decoder chunk starts.
+_TAKEOVER_FRAMES = 4
+_FRAMES_PER_CHUNK = 17              # frames decoded from one 5-latent chunk
 _LOCK_REFERENCE_FRAMES = 17         # a shot's opening frames that define the look held
 _CUT_MIN = 0.08                     # frame-to-frame structural change that is always a cut
 _CUT_RATIO = 6.0                    # ... or this many times the window's typical change
@@ -256,6 +262,10 @@ class _Config:
         # instead of from the finished (8-bit, or for Continue Video, compressed)
         # frame.  Off by default while it is being evaluated.
         self.latent_anchor = _flag("H3LC_LATENT_ANCHOR", "0")
+        # With Wan2GP's Discard Last Frames at 4, decode each new window together
+        # with the carried end of the previous one, so the join is blended the
+        # way the middle of a clip is.
+        self.takeover = _flag("H3LC_TAKEOVER", "1")
         # Hold each continuous shot to the look of its own opening.  Off by
         # default: a plugin update should not quietly start altering frames.
         self.colour = _flag("H3LC_COLOUR", "0")
@@ -399,7 +409,17 @@ class _State:
                       "restored": 0, "saved": 0, "save_skipped": 0,
                       "hook_generate_media": 0, "hook_save_video": 0,
                       "hook_record_file": 0, "windows": 0, "passthrough": 0,
-                      "anchor_from_latents": 0, "anchor_native": 0}
+                      "anchor_from_latents": 0, "anchor_native": 0,
+                      "takeover": 0, "joint_decode": 0}
+        # Frames the previous window's video lost to Discard Last Frames, which
+        # decides where in the cached tail the join sits.  Set at capture from
+        # the job, or from a saved entry's manifest.
+        self.source_discard = 0
+        # This window carries the history that ends one frame before a join on
+        # a latent boundary (the takeover layout), and the carried latents to
+        # decode ahead of it.
+        self.takeover = False
+        self.takeover_prefix = None
         # Carried latents waiting to become this stage's join frame; set when
         # the history block is carried, consumed by the next frame-0 condition.
         self.anchor_latents = None
@@ -431,7 +451,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -756,7 +776,16 @@ def _latent_count(frames):
     return 2 + ((max(5, int(frames)) - 5) // _CLIP_LENGTH) * _LATENT_PERIOD
 
 
-def _check_alignment(signatures, signature, incoming):
+def _job_discard():
+    """Discard Last Frames for the running job, 0 when it is not known."""
+    job = JOB.get()
+    try:
+        return max(0, int((job or {}).get("discard_last_frames") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_alignment(signatures, signature, incoming, expected_offset=_ALIGN_EXPECTED_OFFSET):
     """Locate the join frame in the cached decoded tail.
 
     The next window hands back `continuation[:, -overlap:-1]`, whose last frame
@@ -775,8 +804,8 @@ def _check_alignment(signatures, signature, incoming):
     Returns (ok, detail).  `detail` names the measured skew in frames when the
     join sits somewhere other than where it must.
     """
-    if signatures is None or signatures.shape[0] < abs(_ALIGN_EXPECTED_OFFSET):
-        if signature is None:
+    if signatures is None or signatures.shape[0] < abs(expected_offset):
+        if signature is None or expected_offset != _ALIGN_EXPECTED_OFFSET:
             return False, "no join fingerprint captured"
         difference = float((incoming - signature).abs().mean())
         if difference > CONFIG.match_tolerance:
@@ -786,7 +815,7 @@ def _check_alignment(signatures, signature, incoming):
 
     errors = (signatures - incoming[None]).abs().mean(dim=(1, 2))
     depth = int(signatures.shape[0])
-    expected_row = depth + _ALIGN_EXPECTED_OFFSET
+    expected_row = depth + expected_offset
     expected_error = float(errors[expected_row])
     best_row = int(errors.argmin())
     best_error = float(errors[best_row])
@@ -804,7 +833,7 @@ def _check_alignment(signatures, signature, incoming):
                      if skew < 0 else "cached latents stop short of it")
         return False, (f"tail misaligned by {skew:+d} frame(s) - {direction} "
                        f"(join matches offset {best_row - depth:+d} at "
-                       f"{best_error:.4f}, expected {_ALIGN_EXPECTED_OFFSET:+d} "
+                       f"{best_error:.4f}, expected {expected_offset:+d} "
                        f"at {expected_error:.4f})")
 
     if expected_error > CONFIG.match_tolerance:
@@ -812,6 +841,41 @@ def _check_alignment(signatures, signature, incoming):
                        f"{CONFIG.match_tolerance:.4f}); cache belongs to a "
                        f"different video")
     return True, None
+
+
+def _joint_decode(vae, latents, args, kwargs):
+    """Decode the window with the carried history in front, then cut it off.
+
+    Only in the takeover layout, where the carried block is whole decoder
+    chunks ending one frame before the join and the window's first latent is
+    the join's 1-frame latent: prefix + window is then a valid latent run, and
+    decoding it in one go cross-fades the window's first frames with the
+    history the way the middle of a clip is, instead of starting them cold.
+    Returns None to decode normally.
+    """
+    prefix = STATE.takeover_prefix
+    STATE.takeover_prefix = None
+    if prefix is None or not CONFIG.takeover:
+        return None
+    try:
+        expected = (STATE.plan or {}).get("expected_latents")
+        if (latents.ndim != 5 or tuple(prefix.shape[-2:]) != tuple(latents.shape[-2:])
+                or prefix.shape[2] % _LATENT_PERIOD or (expected and latents.shape[2] != expected)):
+            _log("joint decode skipped: the window is not laid out as expected")
+            return None
+        joined = torch.cat([prefix.to(device=latents.device, dtype=latents.dtype), latents], dim=2)
+        decoded = _ORIGINALS["decode"](vae, joined, *args, **kwargs)
+        skip = (prefix.shape[2] // _LATENT_PERIOD) * _FRAMES_PER_CHUNK
+        frames = 2 + (latents.shape[2] - 2) // _LATENT_PERIOD * _FRAMES_PER_CHUNK + 3
+        if decoded.shape[2] - skip != frames:
+            _log(f"joint decode skipped: {decoded.shape[2] - skip} frames where {frames} were expected")
+            return None
+        STATE.stats["joint_decode"] += 1
+        _log(f"decoded the window with {skip} frames of the previous one ahead of it")
+        return decoded[:, :, skip:]
+    except Exception as error:                                   # never break a render
+        _log(f"joint decode failed, decoding normally: {error!r}")
+        return None
 
 
 def _patched_decode(self, latents, *args, **kwargs):
@@ -822,7 +886,9 @@ def _patched_decode(self, latents, *args, **kwargs):
     # cannot break that way again.
     if _PASSTHROUGH.get() is not None:
         return _ORIGINALS["decode"](self, latents, *args, **kwargs)
-    decoded = _ORIGINALS["decode"](self, latents, *args, **kwargs)
+    decoded = _joint_decode(self, latents, args, kwargs)
+    if decoded is None:
+        decoded = _ORIGINALS["decode"](self, latents, *args, **kwargs)
     STATE.colour_step = None
     STATE.decoding_latents = int(latents.shape[2])
     if CONFIG.colour:
@@ -870,6 +936,7 @@ def _patched_decode(self, latents, *args, **kwargs):
             STATE.source_window_no = plan.get("window_no")
             STATE.usable = bool(plan.get("usable"))
             STATE.expected_latents = plan.get("expected_latents")
+            STATE.source_discard = _job_discard()
     except Exception as error:                                   # never break a render
         _log(f"capture failed, continuing without cache: {error!r}")
         STATE.invalidate("capture error")
@@ -962,6 +1029,13 @@ def _patched_encode_audio(self, waveform, *args, **kwargs):
     continues, reason = _continues_cached_window(source_window_no)
     if not continues:
         _log(f"re-encoding continuation audio ({reason})")
+        return native
+
+    if STATE.source_discard:
+        # Discarded frames rarely land on the 40/s audio grid (4 frames at 24 fps
+        # are 6 2/3 latents), so the cached audio cannot be cut at the join.
+        _log(f"re-encoding continuation audio (Discard Last Frames "
+             f"{STATE.source_discard} does not end on an audio latent)")
         return native
 
     matched, reason = _audio_matches(signature, _audio_signature(waveform))
@@ -1364,6 +1438,8 @@ def _patched_generate(self, *args, **kwargs):
     # Never let a join frame pending from an earlier call reach this one's
     # start image.
     STATE.anchor_latents = None
+    STATE.takeover = False
+    STATE.takeover_prefix = None
     if ON_GENERATE is not None:
         try:
             ON_GENERATE()
@@ -1531,7 +1607,8 @@ def _match_saved_by_content(plan, job, incoming, limit=50):
                                                                dtype=np.float32))
         except Exception:
             continue
-        aligned, _detail = _check_alignment(signatures, None, incoming)
+        offset = _ALIGN_EXPECTED_OFFSET - (_int_or_none(manifest.get("discard_last_frames")) or 0)
+        aligned, _detail = _check_alignment(signatures, None, incoming, offset)
         if aligned:
             return sha
     return None
@@ -1645,6 +1722,7 @@ def _seed_from_entry(found, sha, note=""):
         STATE.usable = True
         STATE.total_latents = int(manifest["total_latents"])
         STATE.expected_latents = _int_or_none(manifest.get("expected_latents"))
+        STATE.source_discard = _int_or_none(manifest.get("discard_last_frames")) or 0
         if audio is not None and not manifest.get("audio_ends_at_join"):
             # Saved before 2.0.1: with Wan2GP v18.19+ its audio may run ~125 ms
             # past the join.  The video is still used; the audio is re-encoded.
@@ -1718,6 +1796,7 @@ def snapshot_for_export(tensor, fps):
         total, expected = STATE.total_latents, STATE.expected_latents
         audio, audio_signature = STATE.audio_latents, STATE.audio_signature
         audio_generation = STATE.audio_generation
+        discard = int(STATE.source_discard or 0)
     if latents is None or signatures is None or source != generation:
         return None, "no latents were captured for the last window"
     if expected is not None and total != expected:
@@ -1744,8 +1823,12 @@ def snapshot_for_export(tensor, fps):
     if (-(-height // _VAE_SPATIAL_FACTOR), -(-width // _VAE_SPATIAL_FACTOR)) != tuple(latents.shape[-2:]):
         differs = (f"it is {width}x{height} but the latents describe "
                    f"{rendered_width}x{rendered_height} (spatial upsampling?)")
-    exported = torch.stack([_fingerprint(tail[:, i]) for i in range(-depth, 0)])
-    errors = (exported - signatures).abs().mean(dim=(1, 2))
+    # Discard Last Frames cut the file `discard` frames before the decoded end.
+    shown = depth - discard
+    if shown < 2:
+        return None, f"Discard Last Frames {discard} leaves too little to fingerprint"
+    exported = torch.stack([_fingerprint(tail[:, i]) for i in range(-shown, 0)])
+    errors = (exported - signatures[:shown]).abs().mean(dim=(1, 2))
     worst = float(errors.max())
     if worst > CONFIG.match_tolerance:
         differs = (f"its last frames differ from the decoded window "
@@ -1772,6 +1855,7 @@ def snapshot_for_export(tensor, fps):
                 "window_no": plan.get("window_no"),
                 "carried_from": STATE.restored,
                 "audio_ends_at_join": True,
+                "discard_last_frames": int(discard),
                 "lock_reference": STATE.lock_reference}
     return {"arrays": arrays, "manifest": manifest}, None
 
@@ -1805,7 +1889,9 @@ def _take_cached(history_video):
         expected = STATE.expected_latents
         total = getattr(STATE, "total_latents", None)
         generation = STATE.generation
+        discard = int(STATE.source_discard or 0)
 
+    STATE.takeover = False
     if latents is None:
         return None, "no cached latents"
     if source != generation - 1:
@@ -1830,6 +1916,11 @@ def _take_cached(history_video):
                       f"need {expected_h}x{expected_w} for {height}x{width})")
 
     wanted = CONFIG.latents or _DEFAULT_LATENTS
+    if discard not in (0, _TAKEOVER_FRAMES):
+        # The join then falls inside a latent: no slice of the cache ends one
+        # frame before it.
+        return None, (f"Discard Last Frames is {discard}; latents can be carried "
+                      f"with 0 or {_TAKEOVER_FRAMES}")
 
     # Do these latents actually depict the frames the pipeline is about to
     # re-encode?  The window-continuity check above rules out a different job;
@@ -1838,9 +1929,24 @@ def _take_cached(history_video):
     # backstop now rather than the only defence, so a similar-looking pair of
     # clips no longer decides anything on its own.
     aligned, detail = _check_alignment(signatures, signature,
-                                       _fingerprint(history_video[:, -1]))
+                                       _fingerprint(history_video[:, -1]),
+                                       _ALIGN_EXPECTED_OFFSET - discard)
     if not aligned:
         return None, detail
+
+    if discard:
+        # Takeover layout.  The previous window lost its last latent's 4 frames,
+        # so the join is its last-but-one latent, the 1-frame one that opens a
+        # decoder chunk.  The history is then whole chunks ending one frame
+        # before it - exactly the shape and place of Wan2GP's own history - so
+        # it needs no coordinate correction.
+        carried = wanted - 2
+        if carried <= 0 or carried + 2 > latents.shape[2]:
+            return None, f"cached tail holds {latents.shape[2]} latents, need {carried + 2}"
+        if total is not None and (total - 2 - carried) % _LATENT_PERIOD:
+            return None, f"slice would start at latent {total - 2 - carried}, off phase"
+        STATE.takeover = True
+        return latents[:, :, -(carried + 2):-2].clone(), None
 
     if wanted % _LATENT_PERIOD != _PHASE_RESIDUE:
         # A window holds 2 + 5k latents, so only n = 2 (mod 5) starts the slice on
@@ -1872,6 +1978,8 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
                                                *args, **kwargs)
     STATE.active_latents = None
     STATE.anchor_latents = None
+    STATE.takeover = False
+    STATE.takeover_prefix = None
     # Cleared per window: a stale value would shift the layout for a window
     # whose audio fell back to the native encode.
     STATE.audio_extra = 0
@@ -1917,13 +2025,18 @@ def _patched_add_video_history(self, video, visual_latents, keyframes, *args, **
     visual_latents.append(latents)
     keyframes.append({"anchor": "history", "latent_frame_count": latents.shape[2]})
     STATE.active_latents = int(latents.shape[2])
+    if STATE.takeover:
+        STATE.stats["takeover"] += 1
+        STATE.takeover_prefix = latents
     if CONFIG.latent_anchor:
         # pipeline.generate pins the join frame right after the history block:
         # add_image_condition(prepare_stage_video(continuation[:, -1:]), 0).
         STATE.anchor_latents = latents
     STATE.stats["engaged"] += 1
     _log(f"carried {latents.shape[2]} latents from the previous window "
-         f"(coords {'corrected' if CONFIG.fix_coords else 'UNCORRECTED'})")
+         + ("(takeover: the join is on a latent boundary, layout as Wan2GP's own)"
+            if STATE.takeover else
+            f"(coords {'corrected' if CONFIG.fix_coords else 'UNCORRECTED'})"))
 
     return None                      # matches stock; see the docstring above
 
@@ -2074,7 +2187,8 @@ def _apply_origin_shift(sequence, text_len, keyframe_anchors, audio_condition_an
     #
     # Moving the block later has neither problem: every other relative distance
     # is untouched by construction, and nothing lands below text_len.
-    delta = _RESERVE_DEFICIT * _FRAME_RESCALE * float(video_time_scale)
+    # The takeover layout is Wan2GP's own: nothing to move.
+    delta = (0 if STATE.takeover else _RESERVE_DEFICIT) * _FRAME_RESCALE * float(video_time_scale)
     block_stop = text_len + carried * rows_per_frame
     times[text_len:block_stop] += delta
 

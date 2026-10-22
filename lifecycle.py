@@ -92,7 +92,7 @@ def _local_path(value):
 def new_job(fallback=False):
     return {"model_type": None, "base_model_type": None, "video_source": None,
             "keep_frames_video_source": "", "pending": None, "last_sha": None,
-            "last_path": None, "fallback": fallback}
+            "last_path": None, "fallback": fallback, "discard_last_frames": 0}
 
 
 def wrap_generate_media(original, get_base_model_type=None):
@@ -115,6 +115,10 @@ def wrap_generate_media(original, get_base_model_type=None):
             if "V" in image_prompt_type:
                 job["video_source"] = _local_path(values.get("video_source"))
             job["keep_frames_video_source"] = str(values.get("keep_frames_video_source") or "")
+            try:
+                job["discard_last_frames"] = max(0, int(values.get("sliding_window_discard_last_frames") or 0))
+            except (TypeError, ValueError):
+                job["discard_last_frames"] = 0
         except Exception as error:
             _log(f"could not read the job's settings, saved latents are off for it: {error!r}")
         if patches.CONFIG.trace:

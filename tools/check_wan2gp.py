@@ -177,6 +177,15 @@ check("pipeline.MiniMaxH3Pipeline._add_image_condition (join frame from latents)
       find(pipeline, "MiniMaxH3Pipeline._add_image_condition") is not None)
 check("the join frame is still pinned right after the history block",
       "add_image_condition(prepare_stage_video(continuation[:, -1:]), 0)" in pipe_src)
+vae_src = ((ROOT / "models/minimax_h3/components/video_autoencoder.py").read_text(errors="replace")
+           if (ROOT / "models/minimax_h3/components/video_autoencoder.py").exists() else "")
+check("the video decoder still works in 17-frame clips with 3 dropped latents (takeover)",
+      "clip_length: int = 17" in vae_src and "token_drop: int = 3" in vae_src)
+wgp_src = (ROOT / "wgp.py").read_text(errors="replace") if (ROOT / "wgp.py").exists() else ""
+check("generate_media still takes sliding_window_discard_last_frames (takeover)",
+      "    sliding_window_discard_last_frames,\n" in wgp_src)
+check("Wan2GP still cuts discarded frames before taking the next overlap (takeover)",
+      "sample = sample[: , :-discard_last_frames]" in wgp_src)
 check("_add_video_history is still what receives the history frames",
       "self._add_video_history(prepare_stage_video(history_frames)" in pipe_src)
 flag = [l.strip() for l in (ROOT / "models/minimax_h3/constants.py").read_text(errors="replace").splitlines()

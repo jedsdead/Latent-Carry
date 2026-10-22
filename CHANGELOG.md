@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.2.0
+
+- **Blend joins** (on by default; works when Wan2GP's Discard Last Frames is 4).
+  A window's last 5 frames are decoded only as a look-ahead, never blended, and
+  a new window's first frames start cold, so every join met two unblended
+  ends. Discarding 4 puts the join on a latent boundary; each window is then
+  decoded with the carried end of the previous one in front of it, so its
+  first frames blend the way the middle of a clip does.
+- With Discard Last Frames at 4 the carried history is exactly Wan2GP's own
+  shape (whole decoder chunks ending one frame before the join), so no
+  coordinate correction is applied. 7, 12 and 17 carried latents become 5, 10
+  and 15.
+- **Fixed:** with Discard Last Frames set, the join check looked for the join
+  4 frames too late. On a slow or static shot it could pass and hand the next
+  window frames from after the join as history. The discard is now read from
+  the job; values other than 0 and 4 re-encode as normal.
+- Audio carry steps aside when frames are discarded (4 frames at 24 fps is not
+  a whole number of audio latents); Wan2GP's own audio continuation is used.
+- Saved latents record the discard, so Continue Video follows the same layout.
+
 ## 2.1.0
 
 - **Join frame from latents** (experimental, off by default). H3 pins the

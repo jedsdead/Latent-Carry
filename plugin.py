@@ -28,7 +28,7 @@ NOTE = "Don't enable together with Sliding Window Latents or Sliding Window Anch
 # Anything the panel exposes.  Env vars still set the initial value; the saved
 # settings file wins over them once the panel has been used.
 TOGGLES = ("enable", "video", "audio", "fix_coords", "colour", "save", "restore",
-           "latent_anchor")
+           "latent_anchor", "takeover")
 STORE_LIMITS = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
 
 
@@ -95,6 +95,11 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     label="Carried latents",
                     info="How much of the previous window is handed on: "
                          "7 = 22 frames, 12 = 39, 17 = 56.")
+                takeover_cb = gr.Checkbox(
+                    value=patches.CONFIG.takeover, label="Blend joins (needs Discard Last Frames = 4)",
+                    info="With Wan2GP's Discard Last Frames at 4, each window is decoded together "
+                         "with the end of the previous one, so the join blends like the middle "
+                         "of a clip.")
                 anchor_cb = gr.Checkbox(
                     value=patches.CONFIG.latent_anchor, label="Join frame from latents",
                     info="Experimental. Builds the frame each window and each Continue "
@@ -158,10 +163,10 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                 timer = gr.Timer(3)
 
                 controls = [enable_cb, video_cb, audio_cb, audio_ctx_dd, latents_dd,
-                            anchor_cb, colour_cb, colour_axes_cb, colour_strength_sl,
+                            takeover_cb, anchor_cb, colour_cb, colour_axes_cb, colour_strength_sl,
                             save_cb, scope_dd, restore_cb, limit_dd, coords_cb]
 
-                def _apply(enable, video, audio, audio_context, carried, latent_anchor,
+                def _apply(enable, video, audio, audio_context, carried, takeover, latent_anchor,
                            colour, colour_axes, colour_strength,
                            save, scope, restore, limit, fix_coords):
                     patches.CONFIG.enable = bool(enable)
@@ -169,6 +174,7 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                     patches.CONFIG.audio = bool(audio)
                     patches.CONFIG.audio_context = float(audio_context)
                     patches.CONFIG.latents = int(carried)
+                    patches.CONFIG.takeover = bool(takeover)
                     patches.CONFIG.latent_anchor = bool(latent_anchor)
                     patches.CONFIG.colour = bool(colour)
                     patches.CONFIG.colour_axes = tuple(a for a in (colour_axes or ()) if a in patches._COLOUR_AXES)
@@ -282,10 +288,14 @@ class H3LatentCarryPlugin(WAN2GPPlugin):
                 f"Last: {patches.STATE.last_message}")
 
     def _anchor_text(self):
-        if not patches.CONFIG.latent_anchor:
-            return ""
         stats = patches.STATE.stats
-        return (f"  \nJoin frames from latents: **{stats.get('anchor_from_latents', 0)}** "
+        text = ""
+        if stats.get("takeover", 0) or stats.get("joint_decode", 0):
+            text += (f"  \nJoins on a latent boundary: **{stats.get('takeover', 0)}** "
+                     f"&nbsp;·&nbsp; blended: **{stats.get('joint_decode', 0)}**")
+        if not patches.CONFIG.latent_anchor:
+            return text
+        return text + (f"  \nJoin frames from latents: **{stats.get('anchor_from_latents', 0)}** "
                 f"&nbsp;·&nbsp; from the video: **{stats.get('anchor_native', 0)}**")
 
     def _entry_choices(self):
