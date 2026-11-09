@@ -15,7 +15,7 @@ adds one decode -> encode round trip to the carried context.
 This module replaces that re-encode with the previous window's *own* latents,
 captured on their way into the decoder.
 
-Seven bindings are patched, all reversible via uninstall():
+Eight bindings are patched, all reversible via uninstall():
 
   1. MiniMaxH3VideoVAE.decode      - capture the tail of the latent tensor plus a
                                      join-frame fingerprint.
@@ -29,6 +29,8 @@ Seven bindings are patched, all reversible via uninstall():
   6. transformer.build_packed_sequence
   7. transformer.build_ref2va_packed_sequence
                                    - correct the time coordinates (see below).
+  8. MiniMaxH3Model._layout        - drop stale audio keyframes (Wan2GP
+                                     Regenerate 2K IC phase 2).
 
 Phase alignment, and why the coordinate correction is small
 -----------------------------------------------------------
@@ -468,7 +470,7 @@ class _State:
 
 STATE = _State()
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 # Per-job context set by lifecycle.py around Wan2GP's generate_media: the model,
 # the Video to Continue path and the truncation setting.  None outside a job.
@@ -2311,6 +2313,12 @@ def _apply_origin_shift(sequence, text_len, keyframe_anchors, audio_condition_an
     # then reaches `extra` latents further back than the video history, with
     # every other relative distance preserved and nothing below text_len.
     extra = int(STATE.audio_extra or 0)
+    if extra and not any((entry[0] if isinstance(entry, tuple) else entry) == "history"
+                         for entry in audio_condition_anchors):
+        # No audio history in this layout (Regenerate 2K IC's phase 2 drops the
+        # audio conditions): there is nothing to make room for, and moving the
+        # rest later would only open a gap between the draft and the target.
+        extra = 0
     if extra:
         # "Everything else" excludes the Ref2VA reference rows.  They sit below
         # the history in time, so moving them later by `extra` would march them
@@ -2397,6 +2405,38 @@ def _patched_build_ref2va_packed_sequence(*args, **kwargs):
     return _shift_from_native("build_ref2va_packed_sequence", sequence, args, kwargs)
 
 
+def _patched_layout(self, text_tags, latent_t, latent_h, latent_w, audio_t, payload,
+                    *args, **kwargs):
+    """Drop audio keyframes that have no condition rows behind them.
+
+    Wan2GP's Regenerate 2K IC phase 2 sets payload["cond_audio_rows"] = None
+    (the draft is its only reference and the audio is frozen) but leaves
+    phase 1's payload["audio_keyframes"] in place.  The packer still reserves
+    rows for them, so any continuation that carries audio - Continue Video or a
+    sliding window - fails in the transformer with "index_copy_(): Number of
+    indices (N) should be equal to source.size(dim) (M)".  This happens with or
+    without Latent Carry (the gap is the audio history length: 30 latents
+    natively at overlap 18, 80 with a 2 s carried audio context).
+
+    Audio keyframes are only ever built together with their condition rows, so
+    keyframes without rows are always stale; clearing them gives the layout the
+    pipeline actually feeds.  Phase 2's target audio is frozen and fully
+    conditioned, so nothing is lost.
+    """
+    if (isinstance(payload, dict) and payload.get("audio_keyframes")
+            and payload.get("cond_audio_rows") is None):
+        dropped = sum(int(entry.get("latent_frame_count", 0) or 0)
+                      for entry in payload["audio_keyframes"])
+        payload["audio_keyframes"] = None
+        for key in ("layout_signature", "layout", "rope"):
+            payload.pop(key, None)
+        _log(f"dropped {dropped} stale audio keyframe latents with no condition "
+             f"rows (Wan2GP Regenerate 2K IC phase 2); the layout now matches "
+             f"the rows fed")
+    return _ORIGINALS["layout"](self, text_tags, latent_t, latent_h, latent_w, audio_t,
+                                payload, *args, **kwargs)
+
+
 # --------------------------------------------------------------------------
 # install / uninstall
 # --------------------------------------------------------------------------
@@ -2418,6 +2458,7 @@ _TARGETS = (
     ("audio_decode", "audio_vae", "decode", False),
     ("encode_audio", "pipeline", "_encode_audio", False),
     ("add_image_condition", "pipeline", "_add_image_condition", False),
+    ("layout", "model", "_layout", False),
 )
 
 _REPLACEMENTS = {
@@ -2429,6 +2470,7 @@ _REPLACEMENTS = {
     "audio_decode": "_patched_audio_decode",
     "encode_audio": "_patched_encode_audio",
     "add_image_condition": "_patched_add_image_condition",
+    "layout": "_patched_layout",
 }
 
 
@@ -2470,6 +2512,9 @@ def _preflight():
         owners["audio_vae"] = MiniMaxH3AudioVAE
     except Exception:
         pass
+    model_class = getattr(transformer, "MiniMaxH3Model", None)
+    if model_class is not None:
+        owners["model"] = model_class
 
     # The frame grid the coordinate maths and the phase rule are built on.
     global _PACKING

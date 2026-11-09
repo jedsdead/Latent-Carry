@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.6.1
+
+- **Fix: Regenerate 2K IC crashed in phase 2 on any continuation with audio.**
+  Wan2GP's Regenerate 2K IC phase 2 drops the audio condition rows but keeps
+  phase 1's audio keyframes, so the packed layout reserved rows nobody fed and
+  the transformer failed with "index_copy_(): Number of indices (N) should be
+  equal to source.size(dim) (M)". This is a Wan2GP bug (19.27) and happens
+  without the plugin too; Latent Carry now drops the stale keyframes before the
+  layout is built (new binding: MiniMaxH3Model._layout, optional).
+- The extended audio context no longer shifts a layout that has no audio
+  history block, which would have opened a gap between the draft reference and
+  the target in that phase 2.
+
 ## 2.6.0
 
 - **Two Phases: phase 1 now carries too.** Phase 1 is where a window's motion
